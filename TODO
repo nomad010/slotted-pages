@@ -1,0 +1,7 @@
+[] Finish extended page implementation
+  [] Make entries 3 bytes
+  [] Add references
+    [] Add a helper struct to make adding references easier. 
+  [] Replace native endian calls.
+[] Add in-memory representation to facilitate testing.
+[] Add Extended representation that is safe to read from multiple sources.
