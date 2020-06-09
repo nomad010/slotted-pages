@@ -450,7 +450,7 @@ impl ExtendedPage {
         let size = u8::from_ne_bytes([bytes[2]]) as usize;
         println!(
             "derp {} {} {} {} {:?}",
-            position, size, position, position_and_references, bytes
+            position, size, references, position_and_references, bytes
         );
         (position, size, references)
     }
@@ -569,7 +569,7 @@ impl ExtendedPage {
     }
 
     fn used_space_start(&self) -> u16 {
-        u16::from_ne_bytes([self.bytes[3], self.bytes[4]])
+        u16::from_ne_bytes([self.bytes[5], self.bytes[6]])
     }
 
     fn free_space_slice(&self) -> &[u8] {
@@ -577,7 +577,7 @@ impl ExtendedPage {
     }
 
     fn free_space_left(&self) -> u32 {
-        self.free_space_slice().len() as u32 - 2
+        self.free_space_slice().len().saturating_sub(3) as u32
     }
 
     fn reserve_space(&mut self, references: usize, length: usize) -> Option<BackingPageGuard> {
@@ -612,7 +612,7 @@ impl ExtendedPage {
                 entry_pointer_end_bytes,
                 used_space_start_bytes,
                 new_entry_pointer_end: 10,
-                new_used_space_start: (PAGE_SIZE - 1 - (length % PAGE_SIZE)) as u16,
+                new_used_space_start: ((PAGE_SIZE - (length % PAGE_SIZE)) % PAGE_SIZE) as u16,
             })
         } else {
             let (_, remaining_bytes) = self.bytes.split_at_mut(1); // Page byte marker
@@ -627,24 +627,30 @@ impl ExtendedPage {
                 u16::from_ne_bytes([used_space_start_bytes[0], used_space_start_bytes[1]]) as usize;
             remaining_bytes = &mut remaining_bytes[entry_pointer_end as usize - 7..];
             let available_space = used_space_start - entry_pointer_end;
-            let data_required_space = Self::total_required_size(length, references).0;
+            let (data_required_space, has_extra_size, has_extra_references) =
+                Self::total_required_size(length, references);
             let total_required_space = data_required_space + 3;
 
             if available_space >= total_required_space {
-                let newly_used_bytes_offset = used_space_start - data_required_space;
-                let (free_bytes, mut newly_used_bytes) = remaining_bytes
-                    .split_at_mut((newly_used_bytes_offset - entry_pointer_end) as usize);
-                let offset = newly_used_bytes_offset << 4 | (length & 15);
-                let offset_bytes = offset.to_ne_bytes();
-                free_bytes[0] = offset_bytes[0];
-                free_bytes[1] = offset_bytes[1];
+                let mut position = used_space_start - data_required_space;
+                let (free_bytes, newly_used_bytes) =
+                    remaining_bytes.split_at_mut((position - entry_pointer_end) as usize);
+                free_bytes[..3].copy_from_slice(&Self::to_entry(position, length, references).0);
+                println!("Gar {} {:?}", length, &free_bytes[..3]);
+                // let offset = newly_used_bytes_offset << 4 | (length & 15);
+                // let offset_bytes = offset.to_ne_bytes();
+                // free_bytes[0..3].copy_from_slice(&offset_bytes);
 
-                if length >= 15 {
-                    let length_bytes = length.to_ne_bytes();
-                    newly_used_bytes[0] = length_bytes[0];
-                    newly_used_bytes[1] = length_bytes[1];
-                    newly_used_bytes = &mut newly_used_bytes[2..];
+                if has_extra_size {
+                    free_bytes[position..position + 2]
+                        .copy_from_slice(&(length as u16).to_ne_bytes());
+                    position += 2;
                 }
+                if has_extra_references {
+                    free_bytes[position..position + 8].copy_from_slice(&references.to_ne_bytes());
+                    position += 8;
+                }
+                println!("roflpi position {}", position);
                 Some(BackingPageGuard {
                     tuple: TupleID::with_page_and_slot(
                         self.page_id,
@@ -653,8 +659,8 @@ impl ExtendedPage {
                     data_bytes: &mut newly_used_bytes[..length],
                     entry_pointer_end_bytes,
                     used_space_start_bytes,
-                    new_entry_pointer_end: entry_pointer_end as u16 + 2,
-                    new_used_space_start: newly_used_bytes_offset as u16,
+                    new_entry_pointer_end: entry_pointer_end as u16 + 3,
+                    new_used_space_start: position as u16,
                 })
             } else {
                 None
