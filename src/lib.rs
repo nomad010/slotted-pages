@@ -182,8 +182,8 @@ impl FileHeader {
     pub fn to_bytes(&self) -> [u8; PAGE_SIZE] {
         let mut bytes = [0u8; PAGE_SIZE];
         bytes[0..5].copy_from_slice(b"MAGIC");
-        bytes[5..13].copy_from_slice(&self.tuples.to_ne_bytes());
-        bytes[13..21].copy_from_slice(&self.pages.to_ne_bytes());
+        bytes[5..13].copy_from_slice(&self.tuples.to_le_bytes());
+        bytes[13..21].copy_from_slice(&self.pages.to_le_bytes());
         bytes
     }
 }
@@ -218,8 +218,8 @@ impl BackingPage {
     fn empty_page(page_id: usize) -> Self {
         let mut bytes: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
         bytes[0] = BACKING_PAGE_MARKER;
-        bytes[1..3].copy_from_slice(&5u16.to_ne_bytes());
-        bytes[3..5].copy_from_slice(&(PAGE_SIZE as u16).to_ne_bytes());
+        bytes[1..3].copy_from_slice(&5u16.to_le_bytes());
+        bytes[3..5].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
         BackingPage { page_id, bytes }
     }
 
@@ -228,14 +228,14 @@ impl BackingPage {
     }
 
     fn set_entry_pointer_end(&mut self, entry_pointer_end: u16) {
-        self.bytes[1..3].copy_from_slice(&entry_pointer_end.to_ne_bytes());
+        self.bytes[1..3].copy_from_slice(&entry_pointer_end.to_le_bytes());
     }
     fn used_space_start(&self) -> u16 {
         u16::from_ne_bytes([self.bytes[3], self.bytes[4]])
     }
 
     fn set_used_space_start(&mut self, used_space_start: u16) {
-        self.bytes[3..5].copy_from_slice(&used_space_start.to_ne_bytes());
+        self.bytes[3..5].copy_from_slice(&used_space_start.to_le_bytes());
     }
 
     fn free_space_slice(&self) -> &[u8] {
@@ -295,12 +295,12 @@ impl BackingPage {
             let (free_bytes, mut newly_used_bytes) = remaining_bytes
                 .split_at_mut((newly_used_bytes_offset - entry_pointer_end) as usize);
             let offset = newly_used_bytes_offset << 4 | (length & 15);
-            let offset_bytes = offset.to_ne_bytes();
+            let offset_bytes = offset.to_le_bytes();
             free_bytes[0] = offset_bytes[0];
             free_bytes[1] = offset_bytes[1];
 
             if length >= 15 {
-                let length_bytes = length.to_ne_bytes();
+                let length_bytes = length.to_le_bytes();
                 newly_used_bytes[0] = length_bytes[0];
                 newly_used_bytes[1] = length_bytes[1];
                 newly_used_bytes = &mut newly_used_bytes[2..];
@@ -350,10 +350,10 @@ impl<'a> PageModificationGuard for BackingPageGuard<'a> {
     fn rollback(self) {}
 
     fn commit(self) -> TupleID {
-        let new_entry_pointer_end_bytes = self.new_entry_pointer_end.to_ne_bytes();
+        let new_entry_pointer_end_bytes = self.new_entry_pointer_end.to_le_bytes();
         self.entry_pointer_end_bytes[0] = new_entry_pointer_end_bytes[0];
         self.entry_pointer_end_bytes[1] = new_entry_pointer_end_bytes[1];
-        let new_used_space_start_bytes = self.new_used_space_start.to_ne_bytes();
+        let new_used_space_start_bytes = self.new_used_space_start.to_le_bytes();
         self.used_space_start_bytes[0] = new_used_space_start_bytes[0];
         self.used_space_start_bytes[1] = new_used_space_start_bytes[1];
         self.tuple
@@ -427,7 +427,7 @@ impl ExtendedPage {
         assert!(size < PAGE_SIZE);
 
         let mut bytes = [0u8, 0u8, 0u8];
-        bytes[0..2].copy_from_slice(&((position << 4) as u16).to_ne_bytes());
+        bytes[0..2].copy_from_slice(&((position << 4) as u16).to_le_bytes());
         let has_extra_references = if references >= 15 {
             bytes[1] |= 15;
             true
@@ -470,9 +470,9 @@ impl ExtendedPage {
         self.bytes.resize_with(total_size, Default::default);
 
         self.bytes[0] = BACKING_PAGE_MARKER;
-        self.bytes[1..3].copy_from_slice(&(total_pages as u16 - 1).to_ne_bytes()); // Initial full pages
-        self.bytes[3..5].copy_from_slice(&7u16.to_ne_bytes()); // End of the entry bytes - initial 7
-        self.bytes[5..7].copy_from_slice(&(PAGE_SIZE as u16).to_ne_bytes()); // Start of data bytes
+        self.bytes[1..3].copy_from_slice(&(total_pages as u16 - 1).to_le_bytes()); // Initial full pages
+        self.bytes[3..5].copy_from_slice(&7u16.to_le_bytes()); // End of the entry bytes - initial 7
+        self.bytes[5..7].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes()); // Start of data bytes
     }
 
     fn bytes_len(&self) -> usize {
@@ -611,12 +611,12 @@ impl ExtendedPage {
             let bytes_start = remaining_bytes.len() - total_data_size;
             let mut bytes = &mut remaining_bytes[bytes_start..];
             if has_extra_size {
-                bytes[..2].copy_from_slice(&(written_size as u16).to_ne_bytes());
+                bytes[..2].copy_from_slice(&(written_size as u16).to_le_bytes());
                 bytes = &mut bytes[2..];
             }
             println!("rawr {} ", bytes.len());
             if has_extra_references {
-                bytes[..8].copy_from_slice(&references.to_ne_bytes());
+                bytes[..8].copy_from_slice(&references.to_le_bytes());
                 bytes = &mut bytes[8..];
             }
             Some(BackingPageGuard {
@@ -652,11 +652,11 @@ impl ExtendedPage {
                 // println!("Gar {} {:?}", length, &free_bytes[..3]);
 
                 if has_extra_size {
-                    newly_used_bytes[..2].copy_from_slice(&(length as u16).to_ne_bytes());
+                    newly_used_bytes[..2].copy_from_slice(&(length as u16).to_le_bytes());
                     newly_used_bytes = &mut newly_used_bytes[2..];
                 }
                 if has_extra_references {
-                    newly_used_bytes[..8].copy_from_slice(&references.to_ne_bytes());
+                    newly_used_bytes[..8].copy_from_slice(&references.to_le_bytes());
                     newly_used_bytes = &mut newly_used_bytes[8..];
                 }
                 // println!("roflpi position {}", position);
@@ -819,7 +819,7 @@ mod tests {
     fn single_writer() {
         let mut file = NaivePageController::from_new(File::create("test.lol").unwrap()).unwrap();
         let mut guard = file.reserve_space(0, 8).unwrap();
-        (&mut *guard).copy_from_slice(&5usize.to_ne_bytes());
+        (&mut *guard).copy_from_slice(&5usize.to_le_bytes());
         guard.commit();
     }
 
@@ -827,10 +827,10 @@ mod tests {
     fn double_writer() {
         let mut file = NaivePageController::from_new(File::create("test_2.lol").unwrap()).unwrap();
         let mut guard = file.reserve_space(0, 8).unwrap();
-        (&mut *guard).copy_from_slice(&5usize.to_ne_bytes());
+        (&mut *guard).copy_from_slice(&5usize.to_le_bytes());
         guard.commit();
         let mut guard = file.reserve_space(0, 8).unwrap();
-        (&mut *guard).copy_from_slice(&900usize.to_ne_bytes());
+        (&mut *guard).copy_from_slice(&900usize.to_le_bytes());
         guard.commit();
         let mut guard = file.reserve_space(0, 6).unwrap();
         (&mut *guard).copy_from_slice("roflpi".as_bytes());
