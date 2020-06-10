@@ -1,6 +1,6 @@
 [] Finish extended page implementation
-  [] Make entries 3 bytes
-  [] Add references
+  ✔ Make entries 3 bytes @done(20-06-10 14:21)
+  [] Add references @started(20-06-10 14:21)
     [] Add a helper struct to make adding references easier. 
   [] Replace native endian calls.
 [] Add in-memory representation to facilitate testing.
