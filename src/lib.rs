@@ -62,60 +62,6 @@ pub trait SegmentControllerEx: SegmentController {
     fn write_segment_ex(&self, segment_id: usize, bytes: &[u8; PAGE_SIZE]) -> Result<()>;
 }
 
-pub enum Page {
-    Simple(BackingPage),
-    Extended(ExtendedPage),
-}
-
-impl Page {
-    fn new_from_item_size(page_id: usize, references: usize, size: usize) -> Self {
-        Page::Extended(ExtendedPage::empty_page(page_id, references, size))
-    }
-
-    fn from_bytes(page_id: usize, bytes: Vec<u8>) -> Result<Page> {
-        match bytes[0] {
-            BACKING_PAGE_MARKER => Ok(Page::Extended(ExtendedPage { page_id, bytes })),
-            x => Err(SlottedPageError::UnknownPageType(x)),
-        }
-    }
-
-    fn to_bytes(&self) -> Cow<[u8]> {
-        match self {
-            Page::Simple(page) => page.to_bytes(),
-            Page::Extended(page) => page.to_bytes(),
-        }
-    }
-
-    fn page_id(&self) -> usize {
-        match self {
-            Page::Simple(page) => page.page_id,
-            Page::Extended(page) => page.page_id(),
-        }
-    }
-
-    fn get_entry_byte_range(&self, entry: usize) -> Option<&[u8]> {
-        // println!("roflpi {}", entry);
-        match self {
-            Page::Simple(page) => page.get_entry_byte_range(entry),
-            Page::Extended(page) => page.get_entry_byte_range(entry),
-        }
-    }
-
-    fn free_space_left(&self) -> usize {
-        match self {
-            Page::Simple(page) => page.free_space_left() as usize,
-            Page::Extended(page) => page.free_space_left() as usize,
-        }
-    }
-
-    fn reserve_space(&mut self, references: usize, length: usize) -> Option<BackingPageGuard> {
-        match self {
-            Page::Simple(page) => page.reserve_space(length as u16),
-            Page::Extended(page) => page.reserve_space(references, length),
-        }
-    }
-}
-
 #[derive(Error, Debug)]
 pub enum SlottedPageError {
     #[error("Malformed File Header")]
@@ -132,23 +78,6 @@ pub enum SlottedPageError {
 }
 
 type Result<T> = std::result::Result<T, SlottedPageError>;
-
-// impl SegmentController for File {
-//     fn read_segments_into(&mut self, segment_id: usize, bytes: &mut [u8]) -> Result<()> {
-//         let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
-//         let bytes = &mut bytes[..length];
-//         println!("{}", segment_id);
-//         self.read_exact_at(bytes, (segment_id * PAGE_SIZE) as u64)?;
-//         Ok(())
-//     }
-
-//     fn write_segments(&mut self, start_segment_id: usize, bytes: &[u8]) -> Result<()> {
-//         let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
-//         let bytes = &bytes[..length];
-//         self.write_all_at(bytes, (start_segment_id * PAGE_SIZE) as u64)
-//             .map_err(SlottedPageError::from)
-//     }
-// }
 
 #[cfg(unix)]
 impl SegmentControllerEx for File {
@@ -212,154 +141,6 @@ impl FileHeader {
     }
 }
 
-// First two bytes indicate the offset of the end of the pointer section of the page.
-// The third and fourth bytes indicate the start of the used data section of the page.
-pub struct BackingPage {
-    page_id: usize,
-    bytes: [u8; PAGE_SIZE],
-}
-
-impl std::fmt::Debug for BackingPage {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        fmt.debug_struct("BackingPage")
-            .field("page_id", &self.page_id)
-            .finish()
-    }
-}
-
-impl BackingPage {
-    pub fn from_bytes(page_id: usize, bytes: [u8; PAGE_SIZE]) -> Result<Page> {
-        match bytes[0] {
-            BACKING_PAGE_MARKER => Ok(Page::Simple(BackingPage { page_id, bytes })),
-            x => Err(SlottedPageError::UnknownPageType(x)),
-        }
-    }
-
-    fn to_bytes(&self) -> Cow<[u8]> {
-        Cow::Borrowed(&self.bytes)
-    }
-
-    fn empty_page(page_id: usize) -> Self {
-        let mut bytes: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-        bytes[0] = BACKING_PAGE_MARKER;
-        bytes[1..3].copy_from_slice(&5u16.to_le_bytes());
-        bytes[3..5].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
-        BackingPage { page_id, bytes }
-    }
-
-    fn entry_pointer_end(&self) -> u16 {
-        u16::from_ne_bytes([self.bytes[3], self.bytes[4]])
-    }
-
-    fn set_entry_pointer_end(&mut self, entry_pointer_end: u16) {
-        self.bytes[1..3].copy_from_slice(&entry_pointer_end.to_le_bytes());
-    }
-    fn used_space_start(&self) -> u16 {
-        u16::from_ne_bytes([self.bytes[3], self.bytes[4]])
-    }
-
-    fn set_used_space_start(&mut self, used_space_start: u16) {
-        self.bytes[3..5].copy_from_slice(&used_space_start.to_le_bytes());
-    }
-
-    fn free_space_slice(&self) -> &[u8] {
-        &self.bytes[self.entry_pointer_end() as usize..self.used_space_start() as usize]
-    }
-
-    fn num_entries(&self) -> usize {
-        // println!("gar {}", self.entry_pointer_end());
-        (self.entry_pointer_end() as usize - 7) / 2
-    }
-
-    fn free_space_left(&self) -> u32 {
-        self.free_space_slice().len() as u32 - 2
-    }
-
-    fn get_entry_offset_and_length(&self, entry: usize) -> Option<(u16, u16)> {
-        if entry < self.num_entries() {
-            let packed_offset_and_length: u16 =
-                u16::from_ne_bytes([self.bytes[5 + 2 * entry], self.bytes[5 + 2 * entry + 1]]);
-            let (mut offset, mut length) =
-                { (packed_offset_and_length >> 4, packed_offset_and_length & 15) };
-            if length == 15 {
-                length = u16::from_ne_bytes([
-                    self.bytes[offset as usize],
-                    self.bytes[offset as usize + 1],
-                ]);
-                offset += 2;
-            }
-            Some((offset, length))
-        } else {
-            None
-        }
-    }
-
-    fn get_entry_byte_range(&self, entry: usize) -> Option<&[u8]> {
-        // println!("Simple get_entry_byte_range({})", entry);
-        self.get_entry_offset_and_length(entry)
-            .map(|(o, l)| &self.bytes[o as usize..(o + l) as usize])
-    }
-
-    fn reserve_space(&mut self, length: u16) -> Option<BackingPageGuard> {
-        let (_, remaining_bytes) = self.bytes.split_at_mut(1);
-        let (entry_pointer_end_bytes, remaining_bytes) = remaining_bytes.split_at_mut(2);
-        let (used_space_start_bytes, mut remaining_bytes) = remaining_bytes.split_at_mut(2);
-
-        let entry_pointer_end =
-            u16::from_ne_bytes([entry_pointer_end_bytes[0], entry_pointer_end_bytes[1]]);
-        let used_space_start =
-            u16::from_ne_bytes([used_space_start_bytes[0], used_space_start_bytes[1]]);
-        remaining_bytes = &mut remaining_bytes[entry_pointer_end as usize - 5..];
-        let available_space = used_space_start - entry_pointer_end;
-        let data_required_space = if length >= 15 { 2 + length } else { length };
-        let total_required_space = data_required_space + 2;
-
-        if available_space >= total_required_space {
-            let newly_used_bytes_offset = used_space_start - data_required_space;
-            let (free_bytes, mut newly_used_bytes) = remaining_bytes
-                .split_at_mut((newly_used_bytes_offset - entry_pointer_end) as usize);
-            let offset = newly_used_bytes_offset << 4 | (length & 15);
-            let offset_bytes = offset.to_le_bytes();
-            free_bytes[0] = offset_bytes[0];
-            free_bytes[1] = offset_bytes[1];
-
-            if length >= 15 {
-                let length_bytes = length.to_le_bytes();
-                newly_used_bytes[0] = length_bytes[0];
-                newly_used_bytes[1] = length_bytes[1];
-                newly_used_bytes = &mut newly_used_bytes[2..];
-            }
-            Some(BackingPageGuard {
-                tuple: TupleID::with_page_and_slot(
-                    self.page_id,
-                    (entry_pointer_end as usize - 4) / 2,
-                ),
-                data_bytes: &mut newly_used_bytes[..length as usize],
-                entry_pointer_end_bytes,
-                used_space_start_bytes,
-                new_entry_pointer_end: entry_pointer_end + 2,
-                new_used_space_start: newly_used_bytes_offset,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-impl Deref for BackingPage {
-    type Target = [u8; PAGE_SIZE];
-
-    fn deref(&self) -> &[u8; PAGE_SIZE] {
-        &self.bytes
-    }
-}
-
-impl DerefMut for BackingPage {
-    fn deref_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
-        &mut self.bytes
-    }
-}
-
 #[derive(Debug)]
 pub struct BackingPageGuard<'a> {
     tuple: TupleID,
@@ -407,12 +188,12 @@ impl<'a> DerefMut for BackingPageGuard<'a> {
 // Position is 12 bytes for exact positioning
 // Size is 8 bits: 255 means the size that is kept in the first 2 bytes of the payload
 // Reference counter is 4 bits: 15 means the number is kept in the first 8 bytes of the payload
-pub struct ExtendedPage {
+pub struct Page {
     page_id: usize,
     bytes: Vec<u8>,
 }
 
-impl ExtendedPage {
+impl Page {
     fn additional_segments(bytes: &[u8]) -> usize {
         u16::from_ne_bytes([bytes[1], bytes[2]]) as usize
     }
@@ -428,7 +209,7 @@ impl ExtendedPage {
         println!("derp load page {}", additional_segments);
         bytes.resize_with(PAGE_SIZE * (additional_segments + 1), Default::default);
         controller.read_segments_into(page_id + 1, &mut bytes[PAGE_SIZE..])?;
-        Ok(ExtendedPage { page_id, bytes })
+        Ok(Page { page_id, bytes })
     }
 
     pub fn total_required_size(size: usize, references: usize) -> (usize, bool, bool) {
@@ -483,7 +264,7 @@ impl ExtendedPage {
 
     fn empty_page(page_id: usize, references: usize, size: usize) -> Self {
         let bytes: Vec<u8> = Vec::new();
-        ExtendedPage { page_id, bytes }
+        Page { page_id, bytes }
     }
 
     fn resize(&mut self, references: usize, size: usize) {
@@ -531,6 +312,7 @@ impl ExtendedPage {
     }
 
     fn num_entries(&self) -> usize {
+        println!("rawr? {}", self.entry_pointer_end());
         (self.entry_pointer_end() as usize - 7) / 3
     }
 
@@ -594,16 +376,20 @@ impl ExtendedPage {
             .map(|(offset, size, _)| &self.bytes[offset..offset + size])
     }
 
-    fn used_space_start(&self) -> u16 {
-        u16::from_ne_bytes([self.bytes[5], self.bytes[6]])
+    fn used_space_start(&self) -> usize {
+        if self.num_entries() == 0 {
+            self.bytes.len()
+        } else {
+            u16::from_ne_bytes([self.bytes[5], self.bytes[6]]) as usize
+        }
     }
 
     fn free_space_slice(&self) -> &[u8] {
         &self.bytes[self.entry_pointer_end() as usize..self.used_space_start() as usize]
     }
 
-    fn free_space_left(&self) -> u32 {
-        self.free_space_slice().len().saturating_sub(3) as u32
+    fn free_space_left(&self) -> usize {
+        self.free_space_slice().len().saturating_sub(3)
     }
 
     fn reserve_space(&mut self, references: usize, length: usize) -> Option<BackingPageGuard> {
@@ -746,19 +532,13 @@ impl<S: SegmentController> NaivePageController<S> {
                 self.save_current_page(false)?;
                 self.current_page = Some((
                     false,
-                    Page::Extended(ExtendedPage::from_bytes(
-                        page_id,
-                        &mut self.segment_controller,
-                    )?),
+                    Page::from_bytes(page_id, &mut self.segment_controller)?,
                 ));
             }
         } else {
             self.current_page = Some((
                 false,
-                Page::Extended(ExtendedPage::from_bytes(
-                    page_id,
-                    &mut self.segment_controller,
-                )?),
+                Page::from_bytes(page_id, &mut self.segment_controller)?,
             ));
         }
         Ok(())
@@ -804,7 +584,7 @@ impl<'a, S: SegmentController> PageController<'a> for NaivePageController<S> {
                 self.header_is_dirty = true;
                 self.current_page = Some((
                     true,
-                    Page::new_from_item_size(self.header.pages as usize, references, data_length),
+                    Page::empty_page(self.header.pages as usize, references, data_length),
                 ));
             }
         } else {
@@ -812,7 +592,7 @@ impl<'a, S: SegmentController> PageController<'a> for NaivePageController<S> {
             self.header_is_dirty = true;
             self.current_page = Some((
                 true,
-                Page::new_from_item_size(self.header.pages as usize, references, data_length),
+                Page::empty_page(self.header.pages as usize, references, data_length),
             ));
         }
         Ok(self
@@ -909,6 +689,29 @@ mod tests {
             let mut guard = file.reserve_space(0, 30000).unwrap();
             (&mut *guard).copy_from_slice("lol".repeat(10000).as_bytes());
             guard.commit();
+        }
+        {
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
+                .unwrap();
+            let entry = std::str::from_utf8(bytes).unwrap();
+            println!("wat {}", bytes.len());
+            assert_eq!(entry, "lol".repeat(10000));
+        }
+    }
+
+    #[test]
+    fn abort_commit() {
+        let mut bytes = Vec::new();
+        {
+            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+            let mut guard = file.reserve_space(0, 30000).unwrap();
+            (&mut *guard).copy_from_slice("lol".repeat(10000).as_bytes());
+            guard.rollback();
+            let mut guard = file.reserve_space(0, 30000).unwrap();
+            (&mut *guard).copy_from_slice("lol".repeat(10000).as_bytes());
+            println!("rawr {:?}", guard.commit());
         }
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
