@@ -70,7 +70,7 @@ impl Page {
     }
 
     fn get_entry_byte_range(&self, entry: usize) -> Option<&[u8]> {
-        println!("roflpi {}", entry);
+        // println!("roflpi {}", entry);
         match self {
             Page::Simple(page) => page.get_entry_byte_range(entry),
             Page::Extended(page) => page.get_entry_byte_range(entry),
@@ -113,6 +113,7 @@ impl SegmentController for File {
     fn read_segments_into(&mut self, segment_id: usize, bytes: &mut [u8]) -> Result<()> {
         let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
         let bytes = &mut bytes[..length];
+        println!("{}", segment_id);
         self.read_exact_at(bytes, (segment_id * PAGE_SIZE) as u64)?;
         Ok(())
     }
@@ -242,7 +243,7 @@ impl BackingPage {
     }
 
     fn num_entries(&self) -> usize {
-        println!("gar {}", self.entry_pointer_end());
+        // println!("gar {}", self.entry_pointer_end());
         (self.entry_pointer_end() as usize - 7) / 2
     }
 
@@ -270,7 +271,7 @@ impl BackingPage {
     }
 
     fn get_entry_byte_range(&self, entry: usize) -> Option<&[u8]> {
-        println!("Simple get_entry_byte_range({})", entry);
+        // println!("Simple get_entry_byte_range({})", entry);
         self.get_entry_offset_and_length(entry)
             .map(|(o, l)| &self.bytes[o as usize..(o + l) as usize])
     }
@@ -400,22 +401,23 @@ impl ExtendedPage {
         bytes.resize_with(PAGE_SIZE, Default::default);
         controller.read_segments_into(page_id, &mut bytes)?;
         let additional_segments = Self::additional_segments(&bytes);
+        println!("derp load page {}", additional_segments);
         bytes.resize_with(PAGE_SIZE * (additional_segments + 1), Default::default);
-        controller.read_segments_into(page_id, &mut bytes[PAGE_SIZE..])?;
+        controller.read_segments_into(page_id + 1, &mut bytes[PAGE_SIZE..])?;
         Ok(ExtendedPage { page_id, bytes })
     }
 
     pub fn total_required_size(size: usize, references: usize) -> (usize, bool, bool) {
         let mut size = size;
         let mut has_extra_size = false;
-        if references >= 15 {
+        if size >= 255 {
             has_extra_size = true;
-            size += 8;
+            size += 2;
         }
         let mut has_extra_references = false;
-        if size >= 255 {
+        if references >= 15 {
             has_extra_references = true;
-            size += 2;
+            size += 8;
         }
         (size, has_extra_size, has_extra_references)
     }
@@ -448,10 +450,10 @@ impl ExtendedPage {
         let position = position_and_references >> 4;
         let references = position_and_references & 15;
         let size = u8::from_ne_bytes([bytes[2]]) as usize;
-        println!(
-            "derp {} {} {} {} {:?}",
-            position, size, references, position_and_references, bytes
-        );
+        // println!(
+        //     "derp {} {} {} {} {:?}",
+        //     position, size, references, position_and_references, bytes
+        // );
         (position, size, references)
     }
 
@@ -509,7 +511,7 @@ impl ExtendedPage {
     }
 
     fn unpack_entry(&self, entry: usize) -> Option<(usize, usize, usize)> {
-        println!("rofl {} {}", entry, self.num_entries());
+        // println!("rofl {} {}", entry, self.num_entries());
         if entry < self.num_entries() {
             let entry_start = 7 + 3 * entry;
             let packed_entry = [
@@ -520,11 +522,15 @@ impl ExtendedPage {
             let (mut offset, mut size, mut references) = Self::from_entry(packed_entry);
             println!(
                 "gargablegar {} {} {} {:#?}",
-                offset,
+                offset, // Offset is getting written wrong
                 size,
                 references,
                 &self.bytes[entry_start..entry_start + 3]
             );
+            if size == 255 {
+                size = u16::from_ne_bytes([self.bytes[offset], self.bytes[offset + 1]]) as usize;
+                offset += 2;
+            }
             if entry == 0 {
                 println!("derp here {}", self.extra_segments());
                 size += PAGE_SIZE * self.extra_segments();
@@ -532,10 +538,6 @@ impl ExtendedPage {
                     size -= PAGE_SIZE;
                     offset += PAGE_SIZE;
                 }
-            }
-            if size == 255 {
-                size = u16::from_ne_bytes([self.bytes[offset], self.bytes[offset + 1]]) as usize;
-                offset += 2;
             }
 
             if references == 15 {
@@ -587,25 +589,36 @@ impl ExtendedPage {
             let (_, remaining_bytes) = self.bytes.split_at_mut(1); // Page byte marker
             let (_, remaining_bytes) = remaining_bytes.split_at_mut(2); // Extra pages
             let (entry_pointer_end_bytes, remaining_bytes) = remaining_bytes.split_at_mut(2);
-            let (used_space_start_bytes, mut remaining_bytes) = remaining_bytes.split_at_mut(2);
+            let (used_space_start_bytes, remaining_bytes) = remaining_bytes.split_at_mut(2);
 
             let (total_data_size, has_extra_size, has_extra_references) =
                 Self::total_required_size(length, references);
-            let mut position = bytes_length - total_data_size;
-            remaining_bytes[..3].copy_from_slice(&Self::to_entry(position, length, references).0);
-            if has_extra_size {
-                let written_size = (PAGE_SIZE - 1 - (length % PAGE_SIZE)) as u16;
-                remaining_bytes[position..position + 2]
-                    .copy_from_slice(&written_size.to_ne_bytes());
-                position += 2;
-            }
-            if has_extra_references {
-                remaining_bytes[position..position + 8].copy_from_slice(&references.to_ne_bytes());
-                position += 8;
-            }
+            let position = bytes_length - total_data_size;
+            let written_size = length % PAGE_SIZE;
+            println!(
+                "{} {} {} {} {} {} {:?}",
+                position,
+                written_size,
+                references,
+                has_extra_size,
+                has_extra_references,
+                total_data_size,
+                Self::to_entry(position, written_size, references)
+            );
+            remaining_bytes[..3]
+                .copy_from_slice(&Self::to_entry(position, written_size, references).0);
 
-            let bytes_start = remaining_bytes.len() - length;
-            let bytes = &mut remaining_bytes[bytes_start..];
+            let bytes_start = remaining_bytes.len() - total_data_size;
+            let mut bytes = &mut remaining_bytes[bytes_start..];
+            if has_extra_size {
+                bytes[..2].copy_from_slice(&(written_size as u16).to_ne_bytes());
+                bytes = &mut bytes[2..];
+            }
+            println!("rawr {} ", bytes.len());
+            if has_extra_references {
+                bytes[..8].copy_from_slice(&references.to_ne_bytes());
+                bytes = &mut bytes[8..];
+            }
             Some(BackingPageGuard {
                 tuple: TupleID::with_page_and_slot(self.page_id, 0),
                 data_bytes: bytes,
@@ -632,25 +645,21 @@ impl ExtendedPage {
             let total_required_space = data_required_space + 3;
 
             if available_space >= total_required_space {
-                let mut position = used_space_start - data_required_space;
-                let (free_bytes, newly_used_bytes) =
+                let position = used_space_start - data_required_space;
+                let (free_bytes, mut newly_used_bytes) =
                     remaining_bytes.split_at_mut((position - entry_pointer_end) as usize);
                 free_bytes[..3].copy_from_slice(&Self::to_entry(position, length, references).0);
-                println!("Gar {} {:?}", length, &free_bytes[..3]);
-                // let offset = newly_used_bytes_offset << 4 | (length & 15);
-                // let offset_bytes = offset.to_ne_bytes();
-                // free_bytes[0..3].copy_from_slice(&offset_bytes);
+                // println!("Gar {} {:?}", length, &free_bytes[..3]);
 
                 if has_extra_size {
-                    free_bytes[position..position + 2]
-                        .copy_from_slice(&(length as u16).to_ne_bytes());
-                    position += 2;
+                    newly_used_bytes[..2].copy_from_slice(&(length as u16).to_ne_bytes());
+                    newly_used_bytes = &mut newly_used_bytes[2..];
                 }
                 if has_extra_references {
-                    free_bytes[position..position + 8].copy_from_slice(&references.to_ne_bytes());
-                    position += 8;
+                    newly_used_bytes[..8].copy_from_slice(&references.to_ne_bytes());
+                    newly_used_bytes = &mut newly_used_bytes[8..];
                 }
-                println!("roflpi position {}", position);
+                // println!("roflpi position {}", position);
                 Some(BackingPageGuard {
                     tuple: TupleID::with_page_and_slot(
                         self.page_id,
@@ -829,16 +838,24 @@ mod tests {
     }
 
     #[test]
+    fn large_writer() {
+        let mut file = NaivePageController::from_new(File::create("test_3.lol").unwrap()).unwrap();
+        let mut guard = file.reserve_space(0, 30000).unwrap();
+        (&mut *guard).copy_from_slice("lol".repeat(10000).as_bytes());
+        guard.commit();
+    }
+
+    #[test]
     fn single_reader() {
         let file = File::open("test.lol").unwrap();
         let mut file = NaivePageController::from_existing(file).unwrap();
         let bytes = file
             .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
             .unwrap();
-        println!(
-            "derp final bytes: {:?}",
-            &[bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],]
-        );
+        // println!(
+        //     "derp final bytes: {:?}",
+        //     &[bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],]
+        // );
         let entry = usize::from_ne_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
@@ -869,5 +886,17 @@ mod tests {
             .unwrap();
         let entry = std::str::from_utf8(bytes).unwrap();
         assert_eq!(entry, "roflpi");
+    }
+
+    #[test]
+    fn large_reader() {
+        let mut file =
+            NaivePageController::from_existing(File::open("test_3.lol").unwrap()).unwrap();
+        let bytes = file
+            .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
+            .unwrap();
+        let entry = std::str::from_utf8(bytes).unwrap();
+        println!("wat {}", bytes.len());
+        assert_eq!(entry, "lol".repeat(10000));
     }
 }
