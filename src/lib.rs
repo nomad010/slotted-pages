@@ -6,7 +6,7 @@ use std::os::unix::fs::FileExt;
 
 use thiserror::Error;
 
-const PAGE_SIZE: usize = 4096;
+const SEGMENT_SIZE: usize = 4096;
 
 const BACKING_PAGE_MARKER: u8 = 1;
 
@@ -18,8 +18,8 @@ pub trait PageModificationGuard {
 pub trait SegmentController {
     fn read_segments_into(&mut self, start_segment_id: usize, bytes: &mut [u8]) -> Result<()>;
 
-    fn read_segment(&mut self, segment_id: usize) -> Result<[u8; PAGE_SIZE]> {
-        let mut bytes = [0; PAGE_SIZE];
+    fn read_segment(&mut self, segment_id: usize) -> Result<[u8; SEGMENT_SIZE]> {
+        let mut bytes = [0; SEGMENT_SIZE];
         self.read_segments_into(segment_id, &mut bytes)?;
         Ok(bytes)
     }
@@ -32,8 +32,8 @@ where
     T: Write + Read + Seek,
 {
     fn read_segments_into(&mut self, segment_id: usize, bytes: &mut [u8]) -> Result<()> {
-        let offset = segment_id * PAGE_SIZE;
-        let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
+        let offset = segment_id * SEGMENT_SIZE;
+        let length = (bytes.len() / SEGMENT_SIZE) * SEGMENT_SIZE;
         let bytes = &mut bytes[..length];
         println!("{}", segment_id);
         self.seek(SeekFrom::Start(offset as u64))?;
@@ -42,8 +42,8 @@ where
     }
 
     fn write_segments(&mut self, start_segment_id: usize, bytes: &[u8]) -> Result<()> {
-        let offset = start_segment_id * PAGE_SIZE;
-        let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
+        let offset = start_segment_id * SEGMENT_SIZE;
+        let length = (bytes.len() / SEGMENT_SIZE) * SEGMENT_SIZE;
         let bytes = &bytes[..length];
         self.seek(SeekFrom::Start(offset as u64))?;
         self.write_all(bytes).map_err(SlottedPageError::from)
@@ -51,15 +51,16 @@ where
 }
 
 pub trait SegmentControllerEx: SegmentController {
-    fn read_segment_into_ex(&self, segment_id: usize, bytes: &mut [u8; PAGE_SIZE]) -> Result<()>;
+    fn read_segment_into_ex(&self, segment_id: usize, bytes: &mut [u8; SEGMENT_SIZE])
+        -> Result<()>;
 
-    fn read_segment_ex(&self, segment_id: usize) -> Result<[u8; PAGE_SIZE]> {
-        let mut bytes = [0; PAGE_SIZE];
+    fn read_segment_ex(&self, segment_id: usize) -> Result<[u8; SEGMENT_SIZE]> {
+        let mut bytes = [0; SEGMENT_SIZE];
         self.read_segment_into_ex(segment_id, &mut bytes)?;
         Ok(bytes)
     }
 
-    fn write_segment_ex(&self, segment_id: usize, bytes: &[u8; PAGE_SIZE]) -> Result<()>;
+    fn write_segment_ex(&self, segment_id: usize, bytes: &[u8; SEGMENT_SIZE]) -> Result<()>;
 }
 
 #[derive(Error, Debug)]
@@ -81,13 +82,17 @@ type Result<T> = std::result::Result<T, SlottedPageError>;
 
 #[cfg(unix)]
 impl SegmentControllerEx for File {
-    fn read_segment_into_ex(&self, segment_id: usize, bytes: &mut [u8; PAGE_SIZE]) -> Result<()> {
-        self.read_exact_at(bytes, (segment_id * PAGE_SIZE) as u64)?;
+    fn read_segment_into_ex(
+        &self,
+        segment_id: usize,
+        bytes: &mut [u8; SEGMENT_SIZE],
+    ) -> Result<()> {
+        self.read_exact_at(bytes, (segment_id * SEGMENT_SIZE) as u64)?;
         Ok(())
     }
 
-    fn write_segment_ex(&self, segment_id: usize, bytes: &[u8; PAGE_SIZE]) -> Result<()> {
-        self.write_all_at(bytes, (segment_id * PAGE_SIZE) as u64)
+    fn write_segment_ex(&self, segment_id: usize, bytes: &[u8; SEGMENT_SIZE]) -> Result<()> {
+        self.write_all_at(bytes, (segment_id * SEGMENT_SIZE) as u64)
             .map_err(SlottedPageError::from)
     }
 }
@@ -117,7 +122,7 @@ impl FileHeader {
         }
     }
 
-    pub fn from_bytes(bytes: [u8; PAGE_SIZE]) -> Result<Self> {
+    pub fn from_bytes(bytes: [u8; SEGMENT_SIZE]) -> Result<Self> {
         if bytes.starts_with(b"MAGIC") {
             let tuples = usize::from_ne_bytes([
                 bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
@@ -132,8 +137,8 @@ impl FileHeader {
         }
     }
 
-    pub fn to_bytes(&self) -> [u8; PAGE_SIZE] {
-        let mut bytes = [0u8; PAGE_SIZE];
+    pub fn to_bytes(&self) -> [u8; SEGMENT_SIZE] {
+        let mut bytes = [0u8; SEGMENT_SIZE];
         bytes[0..5].copy_from_slice(b"MAGIC");
         bytes[5..13].copy_from_slice(&self.tuples.to_le_bytes());
         bytes[13..21].copy_from_slice(&self.pages.to_le_bytes());
@@ -181,7 +186,7 @@ impl<'a> DerefMut for BackingPageGuard<'a> {
 
 // An extended page holds only a single item. The length of this item is stored in the first four
 // bytes. The number of pages that compose the the extended page is calculated as:
-// (length + 4) / PAGE_SIZE rounded up.
+// (length + 4) / SEGMENT_SIZE rounded up.
 // Each entry thing is 24 bits:
 // 012345678901234567890123
 // ppppppppppppssssssssxxxx
@@ -203,12 +208,12 @@ impl Page {
         S: SegmentController,
     {
         let mut bytes: Vec<u8> = Vec::new();
-        bytes.resize_with(PAGE_SIZE, Default::default);
+        bytes.resize_with(SEGMENT_SIZE, Default::default);
         controller.read_segments_into(page_id, &mut bytes)?;
         let additional_segments = Self::additional_segments(&bytes);
         println!("derp load page {}", additional_segments);
-        bytes.resize_with(PAGE_SIZE * (additional_segments + 1), Default::default);
-        controller.read_segments_into(page_id + 1, &mut bytes[PAGE_SIZE..])?;
+        bytes.resize_with(SEGMENT_SIZE * (additional_segments + 1), Default::default);
+        controller.read_segments_into(page_id + 1, &mut bytes[SEGMENT_SIZE..])?;
         Ok(Page { page_id, bytes })
     }
 
@@ -228,8 +233,8 @@ impl Page {
     }
 
     pub fn to_entry(position: usize, size: usize, references: usize) -> ([u8; 3], bool, bool) {
-        assert!(position < PAGE_SIZE);
-        assert!(size < PAGE_SIZE);
+        assert!(position < SEGMENT_SIZE);
+        assert!(size < SEGMENT_SIZE);
 
         let mut bytes = [0u8, 0u8, 0u8];
         bytes[0..2].copy_from_slice(&((position << 4) as u16).to_le_bytes());
@@ -270,14 +275,14 @@ impl Page {
     fn resize(&mut self, references: usize, size: usize) {
         let total_data_size = Self::total_required_size(size, references).0;
         let required_length = total_data_size + 10;
-        let total_pages = (required_length + PAGE_SIZE - 1) / PAGE_SIZE;
-        let total_size = total_pages * PAGE_SIZE;
+        let total_pages = (required_length + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
+        let total_size = total_pages * SEGMENT_SIZE;
         self.bytes.resize_with(total_size, Default::default);
 
         self.bytes[0] = BACKING_PAGE_MARKER;
         self.bytes[1..3].copy_from_slice(&(total_pages as u16 - 1).to_le_bytes()); // Initial full pages
         self.bytes[3..5].copy_from_slice(&7u16.to_le_bytes()); // End of the entry bytes - initial 7
-        self.bytes[5..7].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes()); // Start of data bytes
+        self.bytes[5..7].copy_from_slice(&(SEGMENT_SIZE as u16).to_le_bytes()); // Start of data bytes
     }
 
     fn bytes_len(&self) -> usize {
@@ -296,7 +301,7 @@ impl Page {
     }
 
     fn pages_len(&self) -> usize {
-        self.bytes_len() / PAGE_SIZE
+        self.bytes_len() / SEGMENT_SIZE
     }
 
     fn page_id(&self) -> usize {
@@ -339,10 +344,10 @@ impl Page {
             }
             if entry == 0 {
                 println!("derp here {}", self.extra_segments());
-                size += PAGE_SIZE * self.extra_segments();
+                size += SEGMENT_SIZE * self.extra_segments();
                 if offset < 10 {
-                    size -= PAGE_SIZE;
-                    offset += PAGE_SIZE;
+                    size -= SEGMENT_SIZE;
+                    offset += SEGMENT_SIZE;
                 }
             }
 
@@ -404,7 +409,7 @@ impl Page {
             let (total_data_size, has_extra_size, has_extra_references) =
                 Self::total_required_size(length, references);
             let position = bytes_length - total_data_size;
-            let written_size = length % PAGE_SIZE;
+            let written_size = length % SEGMENT_SIZE;
             println!(
                 "{} {} {} {} {} {} {:?}",
                 position,
@@ -435,7 +440,8 @@ impl Page {
                 entry_pointer_end_bytes,
                 used_space_start_bytes,
                 new_entry_pointer_end: 10,
-                new_used_space_start: ((PAGE_SIZE - (length % PAGE_SIZE)) % PAGE_SIZE) as u16,
+                new_used_space_start: ((SEGMENT_SIZE - (length % SEGMENT_SIZE)) % SEGMENT_SIZE)
+                    as u16,
             })
         } else {
             let (_, remaining_bytes) = self.bytes.split_at_mut(1); // Page byte marker
@@ -721,6 +727,29 @@ mod tests {
             let entry = std::str::from_utf8(bytes).unwrap();
             println!("wat {}", bytes.len());
             assert_eq!(entry, "lol".repeat(10000));
+        }
+    }
+
+    #[test]
+    fn abort_commit_small() {
+        let mut bytes = Vec::new();
+        {
+            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+            let mut guard = file.reserve_space(0, 30000).unwrap();
+            (&mut *guard).copy_from_slice("lol".repeat(10000).as_bytes());
+            guard.rollback();
+            let mut guard = file.reserve_space(0, 3).unwrap();
+            (&mut *guard).copy_from_slice("lol".as_bytes());
+            println!("rawr {:?}", guard.commit());
+        }
+        {
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
+                .unwrap();
+            let entry = std::str::from_utf8(bytes).unwrap();
+            println!("wat {}", bytes.len());
+            assert_eq!(entry, "lol");
         }
     }
 }
