@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fs::File;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::FileExt;
 
@@ -24,6 +25,29 @@ pub trait SegmentController {
     }
 
     fn write_segments(&mut self, start_segment_id: usize, bytes: &[u8]) -> Result<()>;
+}
+
+impl<T> SegmentController for T
+where
+    T: Write + Read + Seek,
+{
+    fn read_segments_into(&mut self, segment_id: usize, bytes: &mut [u8]) -> Result<()> {
+        let offset = segment_id * PAGE_SIZE;
+        let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
+        let bytes = &mut bytes[..length];
+        println!("{}", segment_id);
+        self.seek(SeekFrom::Start(offset as u64))?;
+        self.read_exact(bytes)?;
+        Ok(())
+    }
+
+    fn write_segments(&mut self, start_segment_id: usize, bytes: &[u8]) -> Result<()> {
+        let offset = start_segment_id * PAGE_SIZE;
+        let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
+        let bytes = &bytes[..length];
+        self.seek(SeekFrom::Start(offset as u64))?;
+        self.write_all(bytes).map_err(SlottedPageError::from)
+    }
 }
 
 pub trait SegmentControllerEx: SegmentController {
@@ -109,22 +133,22 @@ pub enum SlottedPageError {
 
 type Result<T> = std::result::Result<T, SlottedPageError>;
 
-impl SegmentController for File {
-    fn read_segments_into(&mut self, segment_id: usize, bytes: &mut [u8]) -> Result<()> {
-        let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
-        let bytes = &mut bytes[..length];
-        println!("{}", segment_id);
-        self.read_exact_at(bytes, (segment_id * PAGE_SIZE) as u64)?;
-        Ok(())
-    }
+// impl SegmentController for File {
+//     fn read_segments_into(&mut self, segment_id: usize, bytes: &mut [u8]) -> Result<()> {
+//         let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
+//         let bytes = &mut bytes[..length];
+//         println!("{}", segment_id);
+//         self.read_exact_at(bytes, (segment_id * PAGE_SIZE) as u64)?;
+//         Ok(())
+//     }
 
-    fn write_segments(&mut self, start_segment_id: usize, bytes: &[u8]) -> Result<()> {
-        let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
-        let bytes = &bytes[..length];
-        self.write_all_at(bytes, (start_segment_id * PAGE_SIZE) as u64)
-            .map_err(SlottedPageError::from)
-    }
-}
+//     fn write_segments(&mut self, start_segment_id: usize, bytes: &[u8]) -> Result<()> {
+//         let length = (bytes.len() / PAGE_SIZE) * PAGE_SIZE;
+//         let bytes = &bytes[..length];
+//         self.write_all_at(bytes, (start_segment_id * PAGE_SIZE) as u64)
+//             .map_err(SlottedPageError::from)
+//     }
+// }
 
 #[cfg(unix)]
 impl SegmentControllerEx for File {
@@ -815,88 +839,85 @@ impl<S: SegmentController> Drop for NaivePageController<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn single_writer() {
-        let mut file = NaivePageController::from_new(File::create("test.lol").unwrap()).unwrap();
-        let mut guard = file.reserve_space(0, 8).unwrap();
-        (&mut *guard).copy_from_slice(&5usize.to_le_bytes());
-        guard.commit();
+    fn single() {
+        let mut bytes = Vec::new();
+        {
+            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+            let mut guard = file.reserve_space(0, 8).unwrap();
+            (&mut *guard).copy_from_slice(&5usize.to_le_bytes());
+            guard.commit();
+        }
+        {
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
+                .unwrap();
+            let entry = usize::from_ne_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+
+            assert_eq!(entry, 5);
+        }
     }
 
     #[test]
-    fn double_writer() {
-        let mut file = NaivePageController::from_new(File::create("test_2.lol").unwrap()).unwrap();
-        let mut guard = file.reserve_space(0, 8).unwrap();
-        (&mut *guard).copy_from_slice(&5usize.to_le_bytes());
-        guard.commit();
-        let mut guard = file.reserve_space(0, 8).unwrap();
-        (&mut *guard).copy_from_slice(&900usize.to_le_bytes());
-        guard.commit();
-        let mut guard = file.reserve_space(0, 6).unwrap();
-        (&mut *guard).copy_from_slice("roflpi".as_bytes());
-        guard.commit();
+    fn multiple() {
+        let mut bytes = Vec::new();
+        {
+            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+            let mut guard = file.reserve_space(0, 8).unwrap();
+            (&mut *guard).copy_from_slice(&5usize.to_le_bytes());
+            guard.commit();
+            let mut guard = file.reserve_space(0, 8).unwrap();
+            (&mut *guard).copy_from_slice(&900usize.to_le_bytes());
+            guard.commit();
+            let mut guard = file.reserve_space(0, 6).unwrap();
+            (&mut *guard).copy_from_slice("roflpi".as_bytes());
+            guard.commit();
+        }
+        {
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
+                .unwrap();
+            let entry = usize::from_ne_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            assert_eq!(entry, 5);
+            let bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
+                .unwrap();
+            let entry = usize::from_ne_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            assert_eq!(entry, 900);
+            let bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 2))
+                .unwrap();
+            let entry = std::str::from_utf8(bytes).unwrap();
+            assert_eq!(entry, "roflpi");
+        }
     }
 
     #[test]
-    fn large_writer() {
-        let mut file = NaivePageController::from_new(File::create("test_3.lol").unwrap()).unwrap();
-        let mut guard = file.reserve_space(0, 30000).unwrap();
-        (&mut *guard).copy_from_slice("lol".repeat(10000).as_bytes());
-        guard.commit();
-    }
-
-    #[test]
-    fn single_reader() {
-        let file = File::open("test.lol").unwrap();
-        let mut file = NaivePageController::from_existing(file).unwrap();
-        let bytes = file
-            .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
-            .unwrap();
-        // println!(
-        //     "derp final bytes: {:?}",
-        //     &[bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],]
-        // );
-        let entry = usize::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-
-        assert_eq!(entry, 5);
-    }
-
-    #[test]
-    fn double_reader() {
-        let file = File::open("test_2.lol").unwrap();
-        let mut file = NaivePageController::from_existing(file).unwrap();
-        let bytes = file
-            .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
-            .unwrap();
-        let entry = usize::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-        assert_eq!(entry, 5);
-        let bytes = file
-            .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
-            .unwrap();
-        let entry = usize::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-        assert_eq!(entry, 900);
-        let bytes = file
-            .get_entry_bytes(TupleID::with_page_and_slot(1, 2))
-            .unwrap();
-        let entry = std::str::from_utf8(bytes).unwrap();
-        assert_eq!(entry, "roflpi");
-    }
-
-    #[test]
-    fn large_reader() {
-        let mut file =
-            NaivePageController::from_existing(File::open("test_3.lol").unwrap()).unwrap();
-        let bytes = file
-            .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
-            .unwrap();
-        let entry = std::str::from_utf8(bytes).unwrap();
-        println!("wat {}", bytes.len());
-        assert_eq!(entry, "lol".repeat(10000));
+    fn large() {
+        let mut bytes = Vec::new();
+        {
+            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+            let mut guard = file.reserve_space(0, 30000).unwrap();
+            (&mut *guard).copy_from_slice("lol".repeat(10000).as_bytes());
+            guard.commit();
+        }
+        {
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
+                .unwrap();
+            let entry = std::str::from_utf8(bytes).unwrap();
+            println!("wat {}", bytes.len());
+            assert_eq!(entry, "lol".repeat(10000));
+        }
     }
 }

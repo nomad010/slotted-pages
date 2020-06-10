@@ -3,5 +3,5 @@
   [] Add references @started(20-06-10 14:21)
     [] Add a helper struct to make adding references easier. 
   ✔ Replace native endian calls. @started(20-06-10 15:29) @done(20-06-10 15:29) @lasted(40s)
-[] Add in-memory representation to facilitate testing.
+✔ Add in-memory representation to facilitate testing. @done(20-06-10 16:25)
 [] Add Extended representation that is safe to read from multiple sources.
