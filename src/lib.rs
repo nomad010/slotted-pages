@@ -10,7 +10,10 @@ const SEGMENT_SIZE: usize = 4096;
 
 const BACKING_PAGE_MARKER: u8 = 1;
 
-pub trait PageModificationGuard {
+pub trait PageModificationGuard<'a> {
+    fn add_reference(&'a mut self, tuple_id: TupleID) -> Result<()>;
+    fn reserve_space(&'a mut self, size: usize) -> Result<&'a mut [u8]>;
+
     fn commit(self) -> TupleID;
     fn rollback(self);
 }
@@ -76,6 +79,9 @@ pub enum SlottedPageError {
 
     #[error("Entry `{}` not found on page `{}`", .0.slot, .0.page)]
     NotFound(TupleID),
+
+    #[error("Insufficient space for request. `{0}` requested, but `{1}` available")]
+    InsufficientSpace(usize, usize),
 }
 
 type Result<T> = std::result::Result<T, SlottedPageError>;
@@ -104,8 +110,31 @@ pub struct TupleID {
 }
 
 impl TupleID {
+    const SERIALIZED_SIZE: usize = 10;
+
     fn with_page_and_slot(page: usize, slot: usize) -> Self {
         TupleID { page, slot }
+    }
+
+    fn to_le_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut result = [0; Self::SERIALIZED_SIZE];
+        result[..8].copy_from_slice(&self.page.to_le_bytes());
+        result[8..].copy_from_slice(&(self.slot as u16).to_le_bytes());
+        result
+    }
+
+    fn to_ne_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut result = [0; Self::SERIALIZED_SIZE];
+        result[..8].copy_from_slice(&self.page.to_ne_bytes());
+        result[8..].copy_from_slice(&(self.slot as u16).to_ne_bytes());
+        result
+    }
+
+    fn to_be_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut result = [0; Self::SERIALIZED_SIZE];
+        result[..8].copy_from_slice(&self.page.to_be_bytes());
+        result[8..].copy_from_slice(&(self.slot as u16).to_be_bytes());
+        result
     }
 }
 
@@ -150,13 +179,43 @@ impl FileHeader {
 pub struct BackingPageGuard<'a> {
     tuple: TupleID,
     data_bytes: &'a mut [u8],
+    references: usize,
     new_entry_pointer_end: u16,
     entry_pointer_end_bytes: &'a mut [u8],
     new_used_space_start: u16,
     used_space_start_bytes: &'a mut [u8],
 }
 
-impl<'a> PageModificationGuard for BackingPageGuard<'a> {
+impl<'a> PageModificationGuard<'a> for BackingPageGuard<'a> {
+    fn add_reference(&'a mut self, tuple_id: TupleID) -> Result<()> {
+        let serialized_reference = tuple_id.to_le_bytes();
+        if let Some(new_references) = self.references.checked_sub(1) {
+            self.references = new_references;
+            let (reference_bytes, new_data_bytes) =
+                self.data_bytes.split_at_mut(serialized_reference.len());
+            self.data_bytes = new_data_bytes;
+            reference_bytes[..8].copy_from_slice(&serialized_reference);
+            Ok(())
+        } else {
+            Err(SlottedPageError::InsufficientSpace(
+                serialized_reference.len(),
+                self.data_bytes.len(),
+            ))
+        }
+    }
+
+    fn reserve_space(&'a mut self, size: usize) -> Result<&'a mut [u8]> {
+        let available = self.data_bytes.len() - self.references * TupleID::SERIALIZED_SIZE;
+        if size > available {
+            let (new_data_bytes, result_bytes) =
+                self.data_bytes.split_at_mut(self.data_bytes.len() - size);
+            self.data_bytes = new_data_bytes;
+            Ok(result_bytes)
+        } else {
+            Err(SlottedPageError::InsufficientSpace(size, available))
+        }
+    }
+
     fn rollback(self) {}
 
     fn commit(self) -> TupleID {
@@ -186,7 +245,7 @@ impl<'a> DerefMut for BackingPageGuard<'a> {
 
 // An extended page holds only a single item. The length of this item is stored in the first four
 // bytes. The number of pages that compose the the extended page is calculated as:
-// (length + 4) / SEGMENT_SIZE rounded up.
+// (length + 10) / SEGMENT_SIZE rounded up.
 // Each entry thing is 24 bits:
 // 012345678901234567890123
 // ppppppppppppssssssssxxxx
@@ -217,8 +276,8 @@ impl Page {
         Ok(Page { page_id, bytes })
     }
 
-    pub fn total_required_size(size: usize, references: usize) -> (usize, bool, bool) {
-        let mut size = size;
+    pub fn total_required_size(data: usize, references: usize) -> (usize, bool, bool) {
+        let mut size = data + TupleID::SERIALIZED_SIZE * references;
         let mut has_extra_size = false;
         if size >= 255 {
             has_extra_size = true;
@@ -267,7 +326,7 @@ impl Page {
         (position, size, references)
     }
 
-    fn empty_page(page_id: usize, references: usize, size: usize) -> Self {
+    fn empty(page_id: usize) -> Self {
         let bytes: Vec<u8> = Vec::new();
         Page { page_id, bytes }
     }
@@ -285,23 +344,8 @@ impl Page {
         self.bytes[5..7].copy_from_slice(&(SEGMENT_SIZE as u16).to_le_bytes()); // Start of data bytes
     }
 
-    fn bytes_len(&self) -> usize {
-        self.bytes.len()
-    }
-
     fn extra_segments(&self) -> usize {
         u16::from_ne_bytes([self.bytes[1], self.bytes[2]]) as usize
-    }
-
-    fn data_len(&self) -> usize {
-        let bytes = &self.bytes;
-        usize::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ])
-    }
-
-    fn pages_len(&self) -> usize {
-        self.bytes_len() / SEGMENT_SIZE
     }
 
     fn page_id(&self) -> usize {
@@ -312,8 +356,8 @@ impl Page {
         Cow::Borrowed(&self.bytes)
     }
 
-    fn entry_pointer_end(&self) -> u16 {
-        u16::from_ne_bytes([self.bytes[3], self.bytes[4]])
+    fn entry_pointer_end(&self) -> usize {
+        u16::from_ne_bytes([self.bytes[3], self.bytes[4]]) as usize
     }
 
     fn num_entries(&self) -> usize {
@@ -442,6 +486,7 @@ impl Page {
                 new_entry_pointer_end: 10,
                 new_used_space_start: ((SEGMENT_SIZE - (length % SEGMENT_SIZE)) % SEGMENT_SIZE)
                     as u16,
+                references,
             })
         } else {
             let (_, remaining_bytes) = self.bytes.split_at_mut(1); // Page byte marker
@@ -486,6 +531,7 @@ impl Page {
                     used_space_start_bytes,
                     new_entry_pointer_end: entry_pointer_end as u16 + 3,
                     new_used_space_start: position as u16,
+                    references,
                 })
             } else {
                 None
@@ -495,7 +541,7 @@ impl Page {
 }
 
 pub trait PageController<'a> {
-    type PageGuard: PageModificationGuard + DerefMut<Target = [u8]>;
+    type PageGuard: PageModificationGuard<'a>;
 
     fn get_header(&self) -> &FileHeader;
 
@@ -588,18 +634,12 @@ impl<'a, S: SegmentController> PageController<'a> for NaivePageController<S> {
             if page.free_space_left() < length {
                 self.header.pages += 1;
                 self.header_is_dirty = true;
-                self.current_page = Some((
-                    true,
-                    Page::empty_page(self.header.pages as usize, references, data_length),
-                ));
+                self.current_page = Some((true, Page::empty(self.header.pages as usize)));
             }
         } else {
             self.header.pages += 1;
             self.header_is_dirty = true;
-            self.current_page = Some((
-                true,
-                Page::empty_page(self.header.pages as usize, references, data_length),
-            ));
+            self.current_page = Some((true, Page::empty(self.header.pages as usize)));
         }
         Ok(self
             .current_page
@@ -751,5 +791,6 @@ mod tests {
             println!("wat {}", bytes.len());
             assert_eq!(entry, "lol");
         }
+        assert_eq!(bytes.len(), 2 * SEGMENT_SIZE);
     }
 }
