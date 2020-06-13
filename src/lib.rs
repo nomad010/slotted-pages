@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::RangeBounds;
 use std::os::unix::fs::FileExt;
+use std::slice::SliceIndex;
 
 use thiserror::Error;
 
@@ -273,19 +275,56 @@ impl<'a> PageModificationGuard<'a> for BackingPageGuard<'a> {
     }
 }
 
-// impl<'a> Deref for BackingPageGuard<'a> {
-//     type Target = [u8];
+pub struct ByteRange<'a> {
+    data_bytes: &'a [u8],
+    reference_bytes: &'a [u8],
+}
 
-//     fn deref(&self) -> &[u8] {
-//         &self.data_bytes
-//     }
-// }
+impl<'a> ByteRange<'a> {
+    pub fn from_bytes(bytes: &'a [u8], references: usize) -> Self {
+        let reference_end = TupleID::SERIALIZED_SIZE * references;
+        let (reference_bytes, data_bytes) = bytes.split_at(reference_end);
+        ByteRange {
+            data_bytes,
+            reference_bytes,
+        }
+    }
 
-// impl<'a> DerefMut for BackingPageGuard<'a> {
-//     fn deref_mut(&mut self) -> &mut [u8] {
-//         &mut self.data_bytes
-//     }
-// }
+    pub fn reference(&self, index: usize) -> Option<TupleID> {
+        let bytes = &self.reference_bytes[index * 10..(index + 1) * 10];
+        if bytes.len() == 10 {
+            Some(TupleID::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9],
+            ]))
+        } else {
+            None
+        }
+    }
+
+    pub fn data_byte(&self, index: usize) -> Option<u8> {
+        self.data_bytes.get(index).copied()
+    }
+
+    pub fn data_byte_range<R>(&self, range: R) -> &[u8]
+    where
+        R: RangeBounds<usize> + SliceIndex<[u8], Output = [u8]>,
+    {
+        &self.data_bytes[range]
+    }
+
+    pub fn split_at(&mut self, reference_position: usize, data_position: usize) -> Self {
+        let (new_reference_bytes, split_reference_bytes) =
+            self.reference_bytes.split_at(reference_position);
+        let (new_data_bytes, split_data_bytes) = self.data_bytes.split_at(data_position);
+        self.reference_bytes = new_reference_bytes;
+        self.data_bytes = new_reference_bytes;
+        Self {
+            reference_bytes: split_reference_bytes,
+            data_bytes: split_data_bytes,
+        }
+    }
+}
 
 // An extended page holds only a single item. The length of this item is stored in the first four
 // bytes. The number of pages that compose the the extended page is calculated as:
@@ -472,7 +511,7 @@ impl Page {
         }
     }
 
-    fn get_entry_byte_range(&self, entry: usize) -> Option<&[u8]> {
+    fn get_entry_byte_range(&self, entry: usize) -> Option<ByteRange> {
         println!(
             "get_entry_byte_range({}) = {:?}",
             entry,
@@ -480,7 +519,8 @@ impl Page {
         );
 
         self.unpack_entry(entry).map(|(offset, size, references)| {
-            &self.bytes[offset..offset + size + TupleID::SERIALIZED_SIZE * references]
+            let bytes = &self.bytes[offset..offset + size + TupleID::SERIALIZED_SIZE * references];
+            ByteRange::from_bytes(bytes, references)
         })
     }
 
@@ -619,7 +659,7 @@ pub trait PageController<'a> {
 
     fn get_header(&self) -> &FileHeader;
 
-    fn get_entry_bytes(&mut self, tuple: TupleID) -> Result<&[u8]>;
+    fn get_entry_bytes(&mut self, tuple: TupleID) -> Result<ByteRange>;
 
     fn reserve_space(&'a mut self, references: usize, data_size: usize) -> Result<Self::PageGuard>;
 }
@@ -689,7 +729,7 @@ impl<'a, S: SegmentController> PageController<'a> for NaivePageController<S> {
         &self.header
     }
 
-    fn get_entry_bytes(&mut self, tuple: TupleID) -> Result<&[u8]> {
+    fn get_entry_bytes(&mut self, tuple: TupleID) -> Result<ByteRange> {
         self.load_page(tuple.page)?;
         let page = self.current_page.as_ref().unwrap();
         page.1
@@ -755,9 +795,10 @@ mod tests {
         }
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
+            let bytes = entry_bytes.data_byte_range(..);
             let entry = usize::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
@@ -792,23 +833,26 @@ mod tests {
         }
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
+            let bytes = entry_bytes.data_byte_range(..);
             let entry = usize::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
             assert_eq!(entry, 5);
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
                 .unwrap();
+            let bytes = entry_bytes.data_byte_range(..);
             let entry = usize::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
             assert_eq!(entry, 900);
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 2))
                 .unwrap();
+            let bytes = entry_bytes.data_byte_range(..);
             let entry = std::str::from_utf8(bytes).unwrap();
             assert_eq!(entry, "roflpi");
         }
@@ -828,9 +872,10 @@ mod tests {
         }
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
+            let bytes = entry_bytes.data_byte_range(..);
             let entry = std::str::from_utf8(bytes).unwrap();
             println!("wat {}", bytes.len());
             assert_eq!(entry, "lol".repeat(10000));
@@ -857,9 +902,10 @@ mod tests {
         }
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
+            let bytes = entry_bytes.data_byte_range(..);
             let entry = std::str::from_utf8(bytes).unwrap();
             println!("wat {}", bytes.len());
             assert_eq!(entry, "lol".repeat(10000));
@@ -886,9 +932,10 @@ mod tests {
         }
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
+            let bytes = entry_bytes.data_byte_range(..);
             let entry = std::str::from_utf8(bytes).unwrap();
             println!("wat {}", bytes.len());
             assert_eq!(entry, "lol");
@@ -910,14 +957,11 @@ mod tests {
         println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            println!("reference bytes: {:?}", bytes);
-            let entry = TupleID::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9],
-            ]);
+            println!("reference bytes: {:?}", &entry_bytes.reference_bytes);
+            let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
             assert_eq!(entry.slot, 1);
         }
@@ -948,24 +992,18 @@ mod tests {
         println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            println!("reference bytes: {:?}", bytes);
-            let entry = TupleID::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9],
-            ]);
+            println!("reference bytes: {:?}", &entry_bytes.reference_bytes);
+            let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
             assert_eq!(entry.slot, 1);
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
                 .unwrap();
-            println!("reference bytes: {:?}", bytes);
-            let entry = TupleID::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9],
-            ]);
+            println!("reference bytes: {:?}", &entry_bytes.reference_bytes);
+            let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
             assert_eq!(entry.slot, 2);
         }
@@ -989,20 +1027,17 @@ mod tests {
         println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            let entry = std::str::from_utf8(bytes).unwrap();
-            println!("wat {}", bytes.len());
+            let entry = std::str::from_utf8(entry_bytes.data_byte_range(..)).unwrap();
+            println!("wat {}", entry_bytes.data_byte_range(..).len());
             assert_eq!(entry.len(), 30000);
             assert_eq!(entry, "lol".repeat(10000));
-            let bytes = file
+            let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
                 .unwrap();
-            let entry = TupleID::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9],
-            ]);
+            let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
             assert_eq!(entry.slot, 0);
         }
