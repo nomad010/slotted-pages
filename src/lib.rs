@@ -119,7 +119,7 @@ impl TupleID {
 
     pub fn to_le_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
         let mut result = [0; Self::SERIALIZED_SIZE];
-        result[..8].copy_from_slice(&self.page.to_le_bytes());
+        result[..8].copy_from_slice(&(self.page as u64).to_le_bytes());
         result[8..].copy_from_slice(&(self.slot as u16).to_le_bytes());
         result
     }
@@ -140,27 +140,27 @@ impl TupleID {
 
     pub fn from_le_bytes(bytes: [u8; Self::SERIALIZED_SIZE]) -> Self {
         TupleID::with_page_and_slot(
-            usize::from_le_bytes([
+            u64::from_le_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]),
+            ]) as usize,
             u16::from_le_bytes([bytes[8], bytes[9]]) as usize,
         )
     }
 
     pub fn from_ne_bytes(bytes: [u8; Self::SERIALIZED_SIZE]) -> Self {
         TupleID::with_page_and_slot(
-            usize::from_ne_bytes([
+            u64::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]),
+            ]) as usize,
             u16::from_ne_bytes([bytes[8], bytes[9]]) as usize,
         )
     }
 
     pub fn from_be_bytes(bytes: [u8; Self::SERIALIZED_SIZE]) -> Self {
         TupleID::with_page_and_slot(
-            usize::from_be_bytes([
+            u64::from_be_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]),
+            ]) as usize,
             u16::from_be_bytes([bytes[8], bytes[9]]) as usize,
         )
     }
@@ -181,13 +181,13 @@ impl FileHeader {
 
     pub fn from_bytes(bytes: [u8; SEGMENT_SIZE]) -> Result<Self> {
         if bytes.starts_with(b"MAGIC") {
-            let tuples = usize::from_ne_bytes([
+            let tuples = u64::from_ne_bytes([
                 bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
-            ]);
-            let pages = usize::from_ne_bytes([
+            ]) as usize;
+            let pages = u64::from_ne_bytes([
                 bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
                 bytes[20],
-            ]);
+            ]) as usize;
             Ok(FileHeader { tuples, pages })
         } else {
             Err(SlottedPageError::MalformedFileHeader)
@@ -197,8 +197,8 @@ impl FileHeader {
     pub fn to_bytes(&self) -> [u8; SEGMENT_SIZE] {
         let mut bytes = [0u8; SEGMENT_SIZE];
         bytes[0..5].copy_from_slice(b"MAGIC");
-        bytes[5..13].copy_from_slice(&self.tuples.to_le_bytes());
-        bytes[13..21].copy_from_slice(&self.pages.to_le_bytes());
+        bytes[5..13].copy_from_slice(&(self.tuples as u64).to_le_bytes());
+        bytes[13..21].copy_from_slice(&(self.pages as u64).to_le_bytes());
         bytes
     }
 }
@@ -454,7 +454,7 @@ impl Page {
 
     pub fn num_entries(&self) -> usize {
         println!("rawr? {}", self.entry_pointer_end());
-        (self.entry_pointer_end() as usize - 7) / 3
+        (self.entry_pointer_end() - 7) / 3
     }
 
     fn unpack_entry(&self, entry: usize) -> Option<(usize, usize, usize)> {
@@ -493,7 +493,7 @@ impl Page {
             }
 
             if references == 15 {
-                references = usize::from_ne_bytes([
+                references = u64::from_ne_bytes([
                     self.bytes[offset],
                     self.bytes[offset + 1],
                     self.bytes[offset + 2],
@@ -502,7 +502,7 @@ impl Page {
                     self.bytes[offset + 5],
                     self.bytes[offset + 6],
                     self.bytes[offset + 7],
-                ]);
+                ]) as usize;
                 offset += 8;
             }
             Some((offset, size, references))
@@ -533,7 +533,7 @@ impl Page {
     }
 
     fn free_space_slice(&self) -> &[u8] {
-        &self.bytes[self.entry_pointer_end() as usize..self.used_space_start() as usize]
+        &self.bytes[self.entry_pointer_end()..self.used_space_start()]
     }
 
     fn free_space_left(&self) -> usize {
@@ -574,7 +574,7 @@ impl Page {
             }
             println!("rawr {} extra {}", bytes.len(), has_extra_references);
             if has_extra_references {
-                bytes[..8].copy_from_slice(&references.to_le_bytes());
+                bytes[..8].copy_from_slice(&(references as u64).to_le_bytes());
                 bytes = &mut bytes[8..];
             }
             println!(
@@ -630,7 +630,7 @@ impl Page {
                     newly_used_bytes = &mut newly_used_bytes[2..];
                 }
                 if has_extra_references {
-                    newly_used_bytes[..8].copy_from_slice(&references.to_le_bytes());
+                    newly_used_bytes[..8].copy_from_slice(&(references as u64).to_le_bytes());
                     newly_used_bytes = &mut newly_used_bytes[8..];
                 }
                 // println!("roflpi position {}", position);
