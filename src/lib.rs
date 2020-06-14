@@ -318,7 +318,7 @@ impl<'a> ByteRange<'a> {
             self.reference_bytes.split_at(reference_position);
         let (new_data_bytes, split_data_bytes) = self.data_bytes.split_at(data_position);
         self.reference_bytes = new_reference_bytes;
-        self.data_bytes = new_reference_bytes;
+        self.data_bytes = new_data_bytes;
         Self {
             reference_bytes: split_reference_bytes,
             data_bytes: split_data_bytes,
@@ -341,10 +341,6 @@ pub struct Page {
 }
 
 impl Page {
-    fn additional_segments(bytes: &[u8]) -> usize {
-        u16::from_ne_bytes([bytes[1], bytes[2]]) as usize
-    }
-
     fn from_bytes<S>(page_id: usize, controller: &mut S) -> Result<Self>
     where
         S: SegmentController,
@@ -352,7 +348,7 @@ impl Page {
         let mut bytes: Vec<u8> = Vec::new();
         bytes.resize_with(SEGMENT_SIZE, Default::default);
         controller.read_segments_into(page_id, &mut bytes)?;
-        let additional_segments = Self::additional_segments(&bytes);
+        let additional_segments = u16::from_ne_bytes([bytes[1], bytes[2]]) as usize;
         println!("derp extra pages {}", additional_segments);
         bytes.resize_with(SEGMENT_SIZE * (additional_segments + 1), Default::default);
         controller.read_segments_into(page_id + 1, &mut bytes[SEGMENT_SIZE..])?;
@@ -436,10 +432,6 @@ impl Page {
         self.bytes[5..7].copy_from_slice(&(SEGMENT_SIZE as u16).to_le_bytes()); // Start of data bytes
     }
 
-    fn extra_segments(&self) -> usize {
-        u16::from_ne_bytes([self.bytes[1], self.bytes[2]]) as usize
-    }
-
     fn page_id(&self) -> usize {
         self.page_id
     }
@@ -483,9 +475,9 @@ impl Page {
                 println!(
                     "derp here adding {} {}",
                     size,
-                    self.extra_segments() * SEGMENT_SIZE
+                    ((self.bytes.len() / SEGMENT_SIZE) - 1) * SEGMENT_SIZE
                 );
-                size += SEGMENT_SIZE * self.extra_segments();
+                size += SEGMENT_SIZE * ((self.bytes.len() / SEGMENT_SIZE) - 1);
                 if offset <= 10 {
                     size -= SEGMENT_SIZE;
                     offset += SEGMENT_SIZE;

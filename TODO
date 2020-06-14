@@ -9,4 +9,18 @@
 [] Add more tests for complex data structures
 [] Use separate counters for the various page metadata.
    This will make a transition to the atomic page versions easier.
+   ✔ Remove the additional_segments calls - can be calculated from the bytes length. @done(20-06-14 23:52)
+   [] Store an additional num_entries variable.
+   [] Store an additional used_space_start variable.
+   [] Make a flush method to flush these to the bytes of the page.
 [] Refactor
+[] Document
+[] Look at pages that are 8K, 16K, 32K, 64K in size.
+[] Add a root entry pointer to the file header.
+[] Write a garbage collector and defragmentor program/library.
+  [] Delete entries not visible from the root entry.
+  [] Shift entries and correct references that point to them.
+[] Should rollback be allowed?
+  This would make extended implementations a lot more difficult to support. We would need to add
+  the entries as a separate field that allows for concurrent modifications. We would need to
+  reserialize the entries again.
