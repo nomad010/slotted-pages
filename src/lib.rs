@@ -1,8 +1,6 @@
 use std::borrow::Cow;
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeBounds;
-use std::os::unix::fs::FileExt;
 use std::slice::SliceIndex;
 
 use thiserror::Error;
@@ -54,19 +52,6 @@ where
     }
 }
 
-pub trait SegmentControllerEx: SegmentController {
-    fn read_segment_into_ex(&self, segment_id: usize, bytes: &mut [u8; SEGMENT_SIZE])
-        -> Result<()>;
-
-    fn read_segment_ex(&self, segment_id: usize) -> Result<[u8; SEGMENT_SIZE]> {
-        let mut bytes = [0; SEGMENT_SIZE];
-        self.read_segment_into_ex(segment_id, &mut bytes)?;
-        Ok(bytes)
-    }
-
-    fn write_segment_ex(&self, segment_id: usize, bytes: &[u8; SEGMENT_SIZE]) -> Result<()>;
-}
-
 #[derive(Error, Debug)]
 pub enum SlottedPageError {
     #[error("Malformed File Header")]
@@ -86,23 +71,6 @@ pub enum SlottedPageError {
 }
 
 type Result<T> = std::result::Result<T, SlottedPageError>;
-
-#[cfg(unix)]
-impl SegmentControllerEx for File {
-    fn read_segment_into_ex(
-        &self,
-        segment_id: usize,
-        bytes: &mut [u8; SEGMENT_SIZE],
-    ) -> Result<()> {
-        self.read_exact_at(bytes, (segment_id * SEGMENT_SIZE) as u64)?;
-        Ok(())
-    }
-
-    fn write_segment_ex(&self, segment_id: usize, bytes: &[u8; SEGMENT_SIZE]) -> Result<()> {
-        self.write_all_at(bytes, (segment_id * SEGMENT_SIZE) as u64)
-            .map_err(SlottedPageError::from)
-    }
-}
 
 #[derive(Debug)]
 pub struct TupleID {
@@ -325,6 +293,14 @@ impl<'a> ByteRange<'a> {
         }
     }
 }
+
+// struct InternalEntry {
+//     position: usize,
+//     size: usize,
+//     reference: usize,
+// }
+
+// impl InternalEntry {}
 
 // An extended page holds only a single item. The length of this item is stored in the first four
 // bytes. The number of pages that compose the the extended page is calculated as:
@@ -1003,6 +979,40 @@ mod tests {
 
     #[test]
     fn single_reference_with_large() {
+        let mut bytes = Vec::new();
+        {
+            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+            let mut guard = file.reserve_space(0, 30000).unwrap();
+            guard
+                .reserve_space(30000)
+                .unwrap()
+                .copy_from_slice("lol".repeat(10000).as_bytes());
+            let tuple_id = guard.commit();
+            let mut guard = file.reserve_space(1, 0).unwrap();
+            guard.add_reference(tuple_id).unwrap();
+            println!("reference saved to: {:?}", guard.commit());
+        }
+        println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
+        {
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let entry_bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
+                .unwrap();
+            let entry = std::str::from_utf8(entry_bytes.data_byte_range(..)).unwrap();
+            println!("wat {}", entry_bytes.data_byte_range(..).len());
+            assert_eq!(entry.len(), 30000);
+            assert_eq!(entry, "lol".repeat(10000));
+            let entry_bytes = file
+                .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
+                .unwrap();
+            let entry = entry_bytes.reference(0).unwrap();
+            assert_eq!(entry.page, 1);
+            assert_eq!(entry.slot, 0);
+        }
+    }
+
+    #[test]
+    fn test_vector() {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
