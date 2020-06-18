@@ -7,15 +7,10 @@ use thiserror::Error;
 
 const SEGMENT_SIZE: usize = 4096;
 
+/*
+TODO: We should replace this marker with a checksum in the page.
+*/
 const BACKING_PAGE_MARKER: u8 = 1;
-
-pub trait PageModificationGuard<'a> {
-    fn add_reference(&mut self, tuple_id: TupleID) -> Result<()>;
-    fn reserve_space(&mut self, size: usize) -> Result<&mut [u8]>;
-
-    fn commit(self) -> TupleID;
-    fn rollback(self);
-}
 
 pub trait SegmentController {
     fn read_segments_into(&mut self, start_segment_id: usize, bytes: &mut [u8]) -> Result<()>;
@@ -54,7 +49,7 @@ where
 
 #[derive(Error, Debug)]
 pub enum SlottedPageError {
-    #[error("Malformed File Header")]
+    #[error("Malformed file header")]
     MalformedFileHeader,
 
     #[error("Unknown page type")]
@@ -72,7 +67,7 @@ pub enum SlottedPageError {
 
 type Result<T> = std::result::Result<T, SlottedPageError>;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct TupleID {
     pub page: usize,
     pub slot: usize,
@@ -135,28 +130,32 @@ impl TupleID {
 }
 
 pub struct FileHeader {
-    tuples: usize,
     pages: usize,
+    pub root: Option<TupleID>,
 }
 
 impl FileHeader {
     pub fn new() -> Self {
         FileHeader {
-            tuples: 0,
             pages: 0,
+            root: None,
         }
     }
 
     pub fn from_bytes(bytes: [u8; SEGMENT_SIZE]) -> Result<Self> {
         if bytes.starts_with(b"MAGIC") {
-            let tuples = u64::from_ne_bytes([
+            let pages = u64::from_ne_bytes([
                 bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
             ]) as usize;
-            let pages = u64::from_ne_bytes([
-                bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
-                bytes[20],
-            ]) as usize;
-            Ok(FileHeader { tuples, pages })
+            let root = if bytes[13] != 0 {
+                Some(TupleID::from_le_bytes([
+                    bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20],
+                    bytes[21], bytes[22], bytes[23],
+                ]))
+            } else {
+                None
+            };
+            Ok(FileHeader { pages, root })
         } else {
             Err(SlottedPageError::MalformedFileHeader)
         }
@@ -165,8 +164,7 @@ impl FileHeader {
     pub fn to_bytes(&self) -> [u8; SEGMENT_SIZE] {
         let mut bytes = [0u8; SEGMENT_SIZE];
         bytes[0..5].copy_from_slice(b"MAGIC");
-        bytes[5..13].copy_from_slice(&(self.tuples as u64).to_le_bytes());
-        bytes[13..21].copy_from_slice(&(self.pages as u64).to_le_bytes());
+        bytes[5..13].copy_from_slice(&(self.pages as u64).to_le_bytes());
         bytes
     }
 }
@@ -183,8 +181,12 @@ pub struct BackingPageGuard<'a> {
     used_space_start_bytes: &'a mut [u8],
 }
 
-impl<'a> PageModificationGuard<'a> for BackingPageGuard<'a> {
-    fn add_reference(&mut self, tuple_id: TupleID) -> Result<()> {
+impl<'a> BackingPageGuard<'a> {
+    pub fn tuple_id(&self) -> TupleID {
+        self.tuple
+    }
+
+    pub fn add_reference(&mut self, tuple_id: TupleID) -> Result<()> {
         // TODO: Add reference is overwriting the next value's initial bytes.
         let serialized_reference = tuple_id.to_le_bytes();
         let data_bytes =
@@ -204,7 +206,7 @@ impl<'a> PageModificationGuard<'a> for BackingPageGuard<'a> {
         }
     }
 
-    fn reserve_space(&mut self, size: usize) -> Result<&mut [u8]> {
+    pub fn reserve_space(&mut self, size: usize) -> Result<&mut [u8]> {
         let available = self.data_length - self.references * TupleID::SERIALIZED_SIZE;
         let data_bytes =
             unsafe { std::slice::from_raw_parts_mut(self.data_bytes, self.data_length) };
@@ -216,9 +218,7 @@ impl<'a> PageModificationGuard<'a> for BackingPageGuard<'a> {
         }
     }
 
-    fn rollback(self) {}
-
-    fn commit(self) -> TupleID {
+    fn inner_commit(&mut self) {
         println!(
             "Updating entry {:?} to {}",
             u16::from_le_bytes([
@@ -239,7 +239,16 @@ impl<'a> PageModificationGuard<'a> for BackingPageGuard<'a> {
             .copy_from_slice(&self.new_entry_pointer_end.to_le_bytes());
         self.used_space_start_bytes
             .copy_from_slice(&self.new_used_space_start.to_le_bytes());
+    }
+
+    pub fn commit(self) -> TupleID {
         self.tuple
+    }
+}
+
+impl<'a> Drop for BackingPageGuard<'a> {
+    fn drop(&mut self) {
+        self.inner_commit();
     }
 }
 
@@ -622,16 +631,6 @@ impl Page {
     }
 }
 
-pub trait PageController<'a> {
-    type PageGuard: PageModificationGuard<'a>;
-
-    fn get_header(&self) -> &FileHeader;
-
-    fn get_entry_bytes(&mut self, tuple: TupleID) -> Result<ByteRange>;
-
-    fn reserve_space(&'a mut self, references: usize, data_size: usize) -> Result<Self::PageGuard>;
-}
-
 pub struct NaivePageController<S: SegmentController> {
     header: FileHeader,
     header_is_dirty: bool,
@@ -690,14 +689,12 @@ impl<S: SegmentController> NaivePageController<S> {
     }
 }
 
-impl<'a, S: SegmentController> PageController<'a> for NaivePageController<S> {
-    type PageGuard = BackingPageGuard<'a>;
-
-    fn get_header(&self) -> &FileHeader {
+impl<'a, S: SegmentController> NaivePageController<S> {
+    pub fn get_header(&self) -> &FileHeader {
         &self.header
     }
 
-    fn get_entry_bytes(&mut self, tuple: TupleID) -> Result<ByteRange> {
+    pub fn get_entry_bytes(&mut self, tuple: TupleID) -> Result<ByteRange> {
         self.load_page(tuple.page)?;
         let page = self.current_page.as_ref().unwrap();
         page.1
@@ -705,11 +702,11 @@ impl<'a, S: SegmentController> PageController<'a> for NaivePageController<S> {
             .ok_or_else(|| SlottedPageError::NotFound(tuple))
     }
 
-    fn reserve_space(
+    pub fn reserve_space(
         &'a mut self,
         references: usize,
         data_length: usize,
-    ) -> Result<Self::PageGuard> {
+    ) -> Result<BackingPageGuard> {
         let length = references * TupleID::SERIALIZED_SIZE + data_length;
         if let Some((dirty, page)) = &mut self.current_page {
             *dirty = true;
@@ -836,7 +833,6 @@ mod tests {
                 .reserve_space(30000)
                 .unwrap()
                 .copy_from_slice("lol".repeat(10000).as_bytes());
-            guard.commit();
         }
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
@@ -848,67 +844,6 @@ mod tests {
             println!("wat {}", bytes.len());
             assert_eq!(entry, "lol".repeat(10000));
         }
-    }
-
-    #[test]
-    fn abort_commit() {
-        let mut bytes = Vec::new();
-        {
-            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, 30000).unwrap();
-            guard
-                .reserve_space(30000)
-                .unwrap()
-                .copy_from_slice("lol".repeat(10000).as_bytes());
-            guard.rollback();
-            let mut guard = file.reserve_space(0, 30000).unwrap();
-            guard
-                .reserve_space(30000)
-                .unwrap()
-                .copy_from_slice("lol".repeat(10000).as_bytes());
-            println!("rawr {:?}", guard.commit());
-        }
-        {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let entry_bytes = file
-                .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
-                .unwrap();
-            let bytes = entry_bytes.data_byte_range(..);
-            let entry = std::str::from_utf8(bytes).unwrap();
-            println!("wat {}", bytes.len());
-            assert_eq!(entry, "lol".repeat(10000));
-        }
-    }
-
-    #[test]
-    fn abort_commit_small() {
-        let mut bytes = Vec::new();
-        {
-            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, 30000).unwrap();
-            guard
-                .reserve_space(30000)
-                .unwrap()
-                .copy_from_slice("lol".repeat(10000).as_bytes());
-            guard.rollback();
-            let mut guard = file.reserve_space(0, 3).unwrap();
-            guard
-                .reserve_space(3)
-                .unwrap()
-                .copy_from_slice("lol".as_bytes());
-            println!("rawr {:?}", guard.commit());
-        }
-        {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let entry_bytes = file
-                .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
-                .unwrap();
-            let bytes = entry_bytes.data_byte_range(..);
-            let entry = std::str::from_utf8(bytes).unwrap();
-            println!("wat {}", bytes.len());
-            assert_eq!(entry, "lol");
-        }
-        assert_eq!(bytes.len(), 2 * SEGMENT_SIZE);
     }
 
     #[test]

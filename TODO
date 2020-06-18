@@ -16,11 +16,15 @@
 [] Refactor
 [] Document
 [] Look at pages that are 8K, 16K, 32K, 64K in size.
-[] Add a root entry pointer to the file header.
+✔ Add a root entry pointer to the file header. @done(20-06-16 23:38)
 [] Write a garbage collector and defragmentor program/library.
   [] Delete entries not visible from the root entry.
   [] Shift entries and correct references that point to them.
-[] Should rollback be allowed?
+✔ Should rollback be allowed? @done(20-06-18 22:48)
   This would make extended implementations a lot more difficult to support. We would need to add
   the entries as a separate field that allows for concurrent modifications. We would need to
   reserialize the entries again.
+
+  Verdict: Nope.
+[] Replace marker with a checksum in the page.
+[] Remove SegmentController trait with just Write + Read + Seek Bounds
