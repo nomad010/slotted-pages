@@ -1,7 +1,5 @@
 use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::ops::RangeBounds;
-use std::slice::SliceIndex;
 
 use thiserror::Error;
 
@@ -66,7 +64,7 @@ pub enum SlottedPageError {
 
 type Result<T> = std::result::Result<T, SlottedPageError>;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TupleID {
     pub page: usize,
     pub slot: usize,
@@ -242,6 +240,67 @@ impl<'a> Drop for BackingPageGuard<'a> {
     }
 }
 
+pub struct ByteRangeReferenceIter<'a> {
+    bytes: &'a [u8],
+    front: usize,
+    back: usize,
+}
+
+impl<'a> Iterator for ByteRangeReferenceIter<'a> {
+    type Item = TupleID;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front != self.back {
+            self.front += TupleID::SERIALIZED_SIZE;
+            let start = self.bytes.len() - self.front;
+            Some(TupleID::from_le_bytes([
+                self.bytes[start + 0],
+                self.bytes[start + 1],
+                self.bytes[start + 2],
+                self.bytes[start + 3],
+                self.bytes[start + 4],
+                self.bytes[start + 5],
+                self.bytes[start + 6],
+                self.bytes[start + 7],
+                self.bytes[start + 8],
+                self.bytes[start + 9],
+            ]))
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let size = (self.back - self.front) / TupleID::SERIALIZED_SIZE;
+        (size, Some(size))
+    }
+}
+
+impl<'a> DoubleEndedIterator for ByteRangeReferenceIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front != self.back {
+            self.back -= TupleID::SERIALIZED_SIZE;
+            let start = self.bytes.len() - self.back;
+            Some(TupleID::from_le_bytes([
+                self.bytes[start + 0],
+                self.bytes[start + 1],
+                self.bytes[start + 2],
+                self.bytes[start + 3],
+                self.bytes[start + 4],
+                self.bytes[start + 5],
+                self.bytes[start + 6],
+                self.bytes[start + 7],
+                self.bytes[start + 8],
+                self.bytes[start + 9],
+            ]))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> ExactSizeIterator for ByteRangeReferenceIter<'a> {}
+
 pub struct ByteRange<'a> {
     data_bytes: &'a [u8],
     reference_bytes: &'a [u8],
@@ -270,33 +329,32 @@ impl<'a> ByteRange<'a> {
         }
     }
 
-    pub fn data_byte_range<R>(&self, range: R) -> &[u8]
-    where
-        R: RangeBounds<usize> + SliceIndex<[u8], Output = [u8]>,
-    {
-        &self.data_bytes[range]
+    pub fn references(&self) -> ByteRangeReferenceIter<'a> {
+        ByteRangeReferenceIter {
+            bytes: self.reference_bytes,
+            front: 0,
+            back: self.reference_bytes.len(),
+        }
+    }
+
+    pub fn data_bytes(&self) -> &[u8] {
+        &self.data_bytes
     }
 
     pub fn split_at(&mut self, reference_position: usize, data_position: usize) -> Self {
-        let (new_reference_bytes, split_reference_bytes) =
-            self.reference_bytes.split_at(reference_position);
         let (new_data_bytes, split_data_bytes) = self.data_bytes.split_at(data_position);
-        self.reference_bytes = new_reference_bytes;
         self.data_bytes = new_data_bytes;
+        let (split_reference_bytes, new_reference_bytes) = self
+            .reference_bytes
+            .split_at(reference_position * TupleID::SERIALIZED_SIZE);
+        self.reference_bytes = new_reference_bytes;
+
         Self {
             reference_bytes: split_reference_bytes,
             data_bytes: split_data_bytes,
         }
     }
 }
-
-// struct InternalEntry {
-//     position: usize,
-//     size: usize,
-//     reference: usize,
-// }
-
-// impl InternalEntry {}
 
 // An extended page holds only a single item. The length of this item is stored in the first four
 // bytes. The number of pages that compose the the extended page is calculated as:
@@ -691,7 +749,7 @@ mod tests {
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            let bytes = entry_bytes.data_byte_range(..);
+            let bytes = entry_bytes.data_bytes();
             let entry = usize::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
@@ -729,7 +787,7 @@ mod tests {
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            let bytes = entry_bytes.data_byte_range(..);
+            let bytes = entry_bytes.data_bytes();
             let entry = usize::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
@@ -737,7 +795,7 @@ mod tests {
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
                 .unwrap();
-            let bytes = entry_bytes.data_byte_range(..);
+            let bytes = entry_bytes.data_bytes();
             let entry = usize::from_ne_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
@@ -745,7 +803,7 @@ mod tests {
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 2))
                 .unwrap();
-            let bytes = entry_bytes.data_byte_range(..);
+            let bytes = entry_bytes.data_bytes();
             let entry = std::str::from_utf8(bytes).unwrap();
             assert_eq!(entry, "roflpi");
         }
@@ -767,7 +825,7 @@ mod tests {
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            let bytes = entry_bytes.data_byte_range(..);
+            let bytes = entry_bytes.data_bytes();
             let entry = std::str::from_utf8(bytes).unwrap();
             assert_eq!(entry, "lol".repeat(10000));
         }
@@ -848,7 +906,7 @@ mod tests {
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            let entry = std::str::from_utf8(entry_bytes.data_byte_range(..)).unwrap();
+            let entry = std::str::from_utf8(entry_bytes.data_bytes()).unwrap();
             assert_eq!(entry.len(), 30000);
             assert_eq!(entry, "lol".repeat(10000));
             let entry_bytes = file
@@ -896,7 +954,7 @@ mod tests {
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            let name_len_bytes = entry_bytes.data_byte_range(0..8);
+            let name_len_bytes = &entry_bytes.data_bytes()[..8];
             let name_len = usize::from_le_bytes([
                 name_len_bytes[0],
                 name_len_bytes[1],
@@ -908,10 +966,10 @@ mod tests {
                 name_len_bytes[7],
             ]);
             assert_eq!(name_len, person.name.len());
-            let name_bytes = entry_bytes.data_byte_range(8..name_len + 8);
+            let name_bytes = &entry_bytes.data_bytes()[8..name_len + 8];
             let name = std::str::from_utf8(name_bytes).unwrap().to_owned();
             assert_eq!(name, person.name);
-            let occupation_bytes = entry_bytes.data_byte_range(name_len + 8..);
+            let occupation_bytes = &entry_bytes.data_bytes[name_len + 8..];
             let occupation = std::str::from_utf8(occupation_bytes).unwrap().to_owned();
             assert_eq!(occupation, person.occupation);
             let new_person = Person { name, occupation };
@@ -927,7 +985,7 @@ mod tests {
         };
 
         let mut bytes = Vec::new();
-        let root_reference = {
+        let (root_reference, name_reference, occupation_reference) = {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
             let mut guard = file.reserve_space(0, person.name.len()).unwrap();
             guard
@@ -942,20 +1000,26 @@ mod tests {
             let mut guard = file.reserve_space(2, 0).unwrap();
             guard.add_reference(name_reference).unwrap();
             guard.add_reference(occupation_reference).unwrap();
-            guard.commit()
+            (guard.commit(), name_reference, occupation_reference)
         };
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
             let entry_bytes = file.get_entry_bytes(root_reference).unwrap();
-            let name_reference = entry_bytes.reference(0).unwrap();
-            let occupation_reference = entry_bytes.reference(1).unwrap();
+            assert_eq!(
+                entry_bytes.references().collect::<Vec<_>>(),
+                vec![name_reference, occupation_reference]
+            );
+            let input_name_reference = entry_bytes.reference(0).unwrap();
+            assert_eq!(input_name_reference, name_reference);
+            let input_occupation_reference = entry_bytes.reference(1).unwrap();
+            assert_eq!(input_occupation_reference, occupation_reference);
             let name_bytes = file.get_entry_bytes(name_reference).unwrap();
-            let name = std::str::from_utf8(name_bytes.data_byte_range(..))
+            let name = std::str::from_utf8(name_bytes.data_bytes())
                 .unwrap()
                 .to_owned();
             assert_eq!(name, person.name);
             let occupation_bytes = file.get_entry_bytes(occupation_reference).unwrap();
-            let occupation = std::str::from_utf8(occupation_bytes.data_byte_range(..))
+            let occupation = std::str::from_utf8(occupation_bytes.data_bytes())
                 .unwrap()
                 .to_owned();
             assert_eq!(occupation, person.occupation);
