@@ -32,7 +32,6 @@ where
         let offset = segment_id * SEGMENT_SIZE;
         let length = (bytes.len() / SEGMENT_SIZE) * SEGMENT_SIZE;
         let bytes = &mut bytes[..length];
-        println!("{}", segment_id);
         self.seek(SeekFrom::Start(offset as u64))?;
         self.read_exact(bytes)?;
         Ok(())
@@ -191,7 +190,6 @@ impl<'a> BackingPageGuard<'a> {
         let serialized_reference = tuple_id.to_le_bytes();
         let data_bytes =
             unsafe { std::slice::from_raw_parts_mut(self.data_bytes, self.data_length) };
-        println!("raew {}", self.data_length);
         if let Some(new_references) = self.references.checked_sub(1) {
             self.references = new_references;
             self.data_length -= serialized_reference.len();
@@ -227,22 +225,6 @@ impl<'a> BackingPageGuard<'a> {
     }
 
     fn inner_commit(&mut self) {
-        println!(
-            "Updating entry {:?} to {}",
-            u16::from_le_bytes([
-                self.entry_pointer_end_bytes[0],
-                self.entry_pointer_end_bytes[1]
-            ]),
-            self.new_entry_pointer_end
-        );
-        println!(
-            "Updating used space {:?} to {}",
-            u16::from_le_bytes([
-                self.used_space_start_bytes[0],
-                self.used_space_start_bytes[1]
-            ]),
-            self.new_used_space_start
-        );
         self.entry_pointer_end_bytes
             .copy_from_slice(&self.new_entry_pointer_end.to_le_bytes());
         self.used_space_start_bytes
@@ -339,7 +321,6 @@ impl Page {
         bytes.resize_with(SEGMENT_SIZE, Default::default);
         controller.read_segments_into(page_id, &mut bytes)?;
         let additional_segments = u16::from_ne_bytes([bytes[1], bytes[2]]) as usize;
-        println!("derp extra pages {}", additional_segments);
         bytes.resize_with(SEGMENT_SIZE * (additional_segments + 1), Default::default);
         controller.read_segments_into(page_id + 1, &mut bytes[SEGMENT_SIZE..])?;
         Ok(Page { page_id, bytes })
@@ -363,13 +344,6 @@ impl Page {
     pub fn to_entry(position: usize, size: usize, references: usize) -> ([u8; 3], bool, bool) {
         assert!(position < SEGMENT_SIZE);
         assert!(size < SEGMENT_SIZE);
-
-        println!(
-            "wat {} and {} wat {:?} ",
-            position,
-            position << 4,
-            &((position << 4) as u16).to_le_bytes()
-        );
 
         let mut bytes = [0u8, 0u8, 0u8];
         let mut position_and_references = (position << 4) as u16;
@@ -397,10 +371,6 @@ impl Page {
         let position = position_and_references >> 4;
         let references = position_and_references & 15;
         let size = u8::from_le_bytes([bytes[2]]) as usize;
-        println!(
-            "derp {} {} {} {} {:?}",
-            position, size, references, position_and_references, bytes
-        );
         (position, size, references)
     }
 
@@ -435,12 +405,10 @@ impl Page {
     }
 
     pub fn num_entries(&self) -> usize {
-        println!("rawr? {}", self.entry_pointer_end());
         (self.entry_pointer_end() - 7) / 3
     }
 
     fn unpack_entry(&self, entry: usize) -> Option<(usize, usize, usize)> {
-        // println!("rofl {} {}", entry, self.num_entries());
         if entry < self.num_entries() {
             let entry_start = 7 + 3 * entry;
             let packed_entry = [
@@ -449,24 +417,11 @@ impl Page {
                 self.bytes[entry_start + 2],
             ];
             let (mut offset, mut size, mut references) = Self::from_entry(packed_entry);
-            println!(
-                "gargablegar {} {} {} {:#?}",
-                offset,
-                size,
-                references,
-                &self.bytes[entry_start..entry_start + 3]
-            );
             if size == 255 {
-                println!("Actually the size is {:?}", &self.bytes[offset..offset + 2]);
                 size = u16::from_ne_bytes([self.bytes[offset], self.bytes[offset + 1]]) as usize;
                 offset += 2;
             }
             if entry == 0 {
-                println!(
-                    "derp here adding {} {}",
-                    size,
-                    ((self.bytes.len() / SEGMENT_SIZE) - 1) * SEGMENT_SIZE
-                );
                 size += SEGMENT_SIZE * ((self.bytes.len() / SEGMENT_SIZE) - 1);
                 if offset <= 10 {
                     size -= SEGMENT_SIZE;
@@ -494,12 +449,6 @@ impl Page {
     }
 
     fn get_entry_byte_range(&self, entry: usize) -> Option<ByteRange> {
-        println!(
-            "get_entry_byte_range({}) = {:?}",
-            entry,
-            self.unpack_entry(entry)
-        );
-
         self.unpack_entry(entry).map(|(offset, size, references)| {
             let bytes = &self.bytes[offset..offset + size + TupleID::SERIALIZED_SIZE * references];
             ByteRange::from_bytes(bytes, references)
@@ -535,16 +484,6 @@ impl Page {
                 Self::total_required_size(length, references);
             let position = bytes_length - total_data_size;
             let written_size = length % SEGMENT_SIZE;
-            println!(
-                "first entry {} {} {} {} {} {} {:?}",
-                position,
-                written_size,
-                references,
-                has_extra_size,
-                has_extra_references,
-                total_data_size,
-                Self::to_entry(position, written_size, references)
-            );
             remaining_bytes[..3]
                 .copy_from_slice(&Self::to_entry(position, written_size, references).0);
 
@@ -554,16 +493,10 @@ impl Page {
                 bytes[..2].copy_from_slice(&(written_size as u16).to_le_bytes());
                 bytes = &mut bytes[2..];
             }
-            println!("rawr {} extra {}", bytes.len(), has_extra_references);
             if has_extra_references {
                 bytes[..8].copy_from_slice(&(references as u64).to_le_bytes());
                 bytes = &mut bytes[8..];
             }
-            println!(
-                "gargable gar {} {}",
-                total_data_size,
-                ((SEGMENT_SIZE - (total_data_size % SEGMENT_SIZE)) % SEGMENT_SIZE)
-            );
             Some(BackingPageGuard {
                 tuple: TupleID::with_page_and_slot(self.page_id, 0),
                 data_length: bytes.len(),
@@ -590,22 +523,13 @@ impl Page {
             let available_space = used_space_start - entry_pointer_end;
             let (data_required_space, has_extra_size, has_extra_references) =
                 Self::total_required_size(length, references);
-            println!("totreqsize: {}", data_required_space);
             let total_required_space = data_required_space + 3;
 
             if available_space >= total_required_space {
                 let position = used_space_start - data_required_space;
                 let (free_bytes, mut newly_used_bytes) =
                     remaining_bytes.split_at_mut((position - entry_pointer_end) as usize);
-                println!(
-                    "whisky {:?} {} {} {}",
-                    Self::to_entry(position, length, references),
-                    position,
-                    length,
-                    references
-                );
                 free_bytes[..3].copy_from_slice(&Self::to_entry(position, length, references).0);
-                // println!("Gar {} {:?}", length, &free_bytes[..3]);
 
                 if has_extra_size {
                     newly_used_bytes[..2].copy_from_slice(&(length as u16).to_le_bytes());
@@ -615,7 +539,6 @@ impl Page {
                     newly_used_bytes[..8].copy_from_slice(&(references as u64).to_le_bytes());
                     newly_used_bytes = &mut newly_used_bytes[8..];
                 }
-                // println!("roflpi position {}", position);
                 Some(BackingPageGuard {
                     tuple: TupleID::with_page_and_slot(
                         self.page_id,
@@ -846,7 +769,6 @@ mod tests {
                 .unwrap();
             let bytes = entry_bytes.data_byte_range(..);
             let entry = std::str::from_utf8(bytes).unwrap();
-            println!("wat {}", bytes.len());
             assert_eq!(entry, "lol".repeat(10000));
         }
     }
@@ -860,15 +782,13 @@ mod tests {
             guard
                 .add_reference(TupleID::with_page_and_slot(1, 1))
                 .unwrap();
-            println!("reference saved to: {:?}", guard.commit());
+            guard.commit();
         }
-        println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            println!("reference bytes: {:?}", &entry_bytes.reference_bytes);
             let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
             assert_eq!(entry.slot, 1);
@@ -885,32 +805,24 @@ mod tests {
                 guard
                     .add_reference(TupleID::with_page_and_slot(1, 1))
                     .unwrap();
-                println!("reference saved to: {:?}", guard.commit());
+                guard.commit();
             }
-            println!(
-                "waterday {}",
-                file.current_page.as_ref().unwrap().1.used_space_start()
-            );
             let mut guard = file.reserve_space(1, 0).unwrap();
             guard
                 .add_reference(TupleID::with_page_and_slot(1, 2))
                 .unwrap();
-            println!("reference saved to: {:?}", guard.commit());
         }
-        println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            println!("reference bytes: {:?}", &entry_bytes.reference_bytes);
             let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
             assert_eq!(entry.slot, 1);
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
                 .unwrap();
-            println!("reference bytes: {:?}", &entry_bytes.reference_bytes);
             let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
             assert_eq!(entry.slot, 2);
@@ -930,16 +842,13 @@ mod tests {
             let tuple_id = guard.commit();
             let mut guard = file.reserve_space(1, 0).unwrap();
             guard.add_reference(tuple_id).unwrap();
-            println!("reference saved to: {:?}", guard.commit());
         }
-        println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
             let entry = std::str::from_utf8(entry_bytes.data_byte_range(..)).unwrap();
-            println!("wat {}", entry_bytes.data_byte_range(..).len());
             assert_eq!(entry.len(), 30000);
             assert_eq!(entry, "lol".repeat(10000));
             let entry_bytes = file
@@ -982,14 +891,12 @@ mod tests {
                 .copy_from_slice(&person.occupation.as_bytes());
             guard.commit();
         }
-        println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
             let name_len_bytes = entry_bytes.data_byte_range(0..8);
-            println!("bytes {:?}", name_len_bytes);
             let name_len = usize::from_le_bytes([
                 name_len_bytes[0],
                 name_len_bytes[1],
@@ -1027,7 +934,6 @@ mod tests {
                 .remaining_data_bytes()
                 .copy_from_slice(&person.name.as_bytes());
             let name_reference = guard.commit();
-            println!("stored reference for name is {:?}", name_reference);
             let mut guard = file.reserve_space(0, person.occupation.len()).unwrap();
             guard
                 .remaining_data_bytes()
@@ -1038,7 +944,6 @@ mod tests {
             guard.add_reference(occupation_reference).unwrap();
             guard.commit()
         };
-        println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
             let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
             let entry_bytes = file.get_entry_bytes(root_reference).unwrap();
@@ -1048,7 +953,6 @@ mod tests {
             let name = std::str::from_utf8(name_bytes.data_byte_range(..))
                 .unwrap()
                 .to_owned();
-            println!("reference for name is {:?}", name_reference);
             assert_eq!(name, person.name);
             let occupation_bytes = file.get_entry_bytes(occupation_reference).unwrap();
             let occupation = std::str::from_utf8(occupation_bytes.data_byte_range(..))
