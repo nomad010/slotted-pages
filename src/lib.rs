@@ -194,9 +194,9 @@ impl<'a> BackingPageGuard<'a> {
         println!("raew {}", self.data_length);
         if let Some(new_references) = self.references.checked_sub(1) {
             self.references = new_references;
-            self.data_bytes = unsafe { self.data_bytes.add(serialized_reference.len()) };
             self.data_length -= serialized_reference.len();
-            data_bytes[..serialized_reference.len()].copy_from_slice(&serialized_reference);
+            let start_bytes = data_bytes.len() - serialized_reference.len();
+            data_bytes[start_bytes..].copy_from_slice(&serialized_reference);
             Ok(())
         } else {
             Err(SlottedPageError::InsufficientSpace(
@@ -210,12 +210,20 @@ impl<'a> BackingPageGuard<'a> {
         let available = self.data_length - self.references * TupleID::SERIALIZED_SIZE;
         let data_bytes =
             unsafe { std::slice::from_raw_parts_mut(self.data_bytes, self.data_length) };
-        if size >= available {
+        if size <= available {
+            self.data_bytes = unsafe { self.data_bytes.add(size) };
             self.data_length -= size;
-            Ok(&mut data_bytes[self.data_length..])
+            Ok(&mut data_bytes[..size])
         } else {
             Err(SlottedPageError::InsufficientSpace(size, available))
         }
+    }
+
+    pub fn remaining_data_bytes(&mut self) -> &mut [u8] {
+        let available = self.data_length - self.references * TupleID::SERIALIZED_SIZE;
+        let data_bytes = unsafe { std::slice::from_raw_parts_mut(self.data_bytes, available) };
+        self.data_length -= available;
+        &mut data_bytes[self.data_length..]
     }
 
     fn inner_commit(&mut self) {
@@ -259,8 +267,8 @@ pub struct ByteRange<'a> {
 
 impl<'a> ByteRange<'a> {
     pub fn from_bytes(bytes: &'a [u8], references: usize) -> Self {
-        let reference_end = TupleID::SERIALIZED_SIZE * references;
-        let (reference_bytes, data_bytes) = bytes.split_at(reference_end);
+        let reference_start = bytes.len() - TupleID::SERIALIZED_SIZE * references;
+        let (data_bytes, reference_bytes) = bytes.split_at(reference_start);
         ByteRange {
             data_bytes,
             reference_bytes,
@@ -268,7 +276,8 @@ impl<'a> ByteRange<'a> {
     }
 
     pub fn reference(&self, index: usize) -> Option<TupleID> {
-        let bytes = &self.reference_bytes[index * 10..(index + 1) * 10];
+        let reference_end = self.reference_bytes.len() - index * TupleID::SERIALIZED_SIZE;
+        let bytes = &self.reference_bytes[reference_end - TupleID::SERIALIZED_SIZE..reference_end];
         if bytes.len() == 10 {
             Some(TupleID::from_le_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -277,10 +286,6 @@ impl<'a> ByteRange<'a> {
         } else {
             None
         }
-    }
-
-    pub fn data_byte(&self, index: usize) -> Option<u8> {
-        self.data_bytes.get(index).copied()
     }
 
     pub fn data_byte_range<R>(&self, range: R) -> &[u8]
@@ -946,20 +951,36 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct Person {
+        name: String,
+        occupation: String,
+    }
+
     #[test]
-    fn test_vector() {
+    fn test_complex() {
+        let person = Person {
+            name: "alice".to_owned(),
+            occupation: "blacksmith".to_owned(),
+        };
+
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, 30000).unwrap();
+            let mut guard = file.reserve_space(0, 8 + 5 + 10).unwrap();
             guard
-                .reserve_space(30000)
+                .reserve_space(8)
                 .unwrap()
-                .copy_from_slice("lol".repeat(10000).as_bytes());
-            let tuple_id = guard.commit();
-            let mut guard = file.reserve_space(1, 0).unwrap();
-            guard.add_reference(tuple_id).unwrap();
-            println!("reference saved to: {:?}", guard.commit());
+                .copy_from_slice(&5usize.to_le_bytes());
+            guard
+                .reserve_space(person.name.len())
+                .unwrap()
+                .copy_from_slice(&person.name.as_bytes());
+            guard
+                .reserve_space(person.occupation.len())
+                .unwrap()
+                .copy_from_slice(&person.occupation.as_bytes());
+            guard.commit();
         }
         println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
         {
@@ -967,16 +988,75 @@ mod tests {
             let entry_bytes = file
                 .get_entry_bytes(TupleID::with_page_and_slot(1, 0))
                 .unwrap();
-            let entry = std::str::from_utf8(entry_bytes.data_byte_range(..)).unwrap();
-            println!("wat {}", entry_bytes.data_byte_range(..).len());
-            assert_eq!(entry.len(), 30000);
-            assert_eq!(entry, "lol".repeat(10000));
-            let entry_bytes = file
-                .get_entry_bytes(TupleID::with_page_and_slot(1, 1))
-                .unwrap();
-            let entry = entry_bytes.reference(0).unwrap();
-            assert_eq!(entry.page, 1);
-            assert_eq!(entry.slot, 0);
+            let name_len_bytes = entry_bytes.data_byte_range(0..8);
+            println!("bytes {:?}", name_len_bytes);
+            let name_len = usize::from_le_bytes([
+                name_len_bytes[0],
+                name_len_bytes[1],
+                name_len_bytes[2],
+                name_len_bytes[3],
+                name_len_bytes[4],
+                name_len_bytes[5],
+                name_len_bytes[6],
+                name_len_bytes[7],
+            ]);
+            assert_eq!(name_len, person.name.len());
+            let name_bytes = entry_bytes.data_byte_range(8..name_len + 8);
+            let name = std::str::from_utf8(name_bytes).unwrap().to_owned();
+            assert_eq!(name, person.name);
+            let occupation_bytes = entry_bytes.data_byte_range(name_len + 8..);
+            let occupation = std::str::from_utf8(occupation_bytes).unwrap().to_owned();
+            assert_eq!(occupation, person.occupation);
+            let new_person = Person { name, occupation };
+            assert_eq!(new_person, person);
+        }
+    }
+
+    #[test]
+    fn test_complex_reference() {
+        let person = Person {
+            name: "alice".to_owned(),
+            occupation: "blacksmith".to_owned(),
+        };
+
+        let mut bytes = Vec::new();
+        let root_reference = {
+            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+            let mut guard = file.reserve_space(0, person.name.len()).unwrap();
+            guard
+                .remaining_data_bytes()
+                .copy_from_slice(&person.name.as_bytes());
+            let name_reference = guard.commit();
+            println!("stored reference for name is {:?}", name_reference);
+            let mut guard = file.reserve_space(0, person.occupation.len()).unwrap();
+            guard
+                .remaining_data_bytes()
+                .copy_from_slice(&person.occupation.as_bytes());
+            let occupation_reference = guard.commit();
+            let mut guard = file.reserve_space(2, 0).unwrap();
+            guard.add_reference(name_reference).unwrap();
+            guard.add_reference(occupation_reference).unwrap();
+            guard.commit()
+        };
+        println!("final bytes: {:?}", &bytes[4096..4096 + 16]);
+        {
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let entry_bytes = file.get_entry_bytes(root_reference).unwrap();
+            let name_reference = entry_bytes.reference(0).unwrap();
+            let occupation_reference = entry_bytes.reference(1).unwrap();
+            let name_bytes = file.get_entry_bytes(name_reference).unwrap();
+            let name = std::str::from_utf8(name_bytes.data_byte_range(..))
+                .unwrap()
+                .to_owned();
+            println!("reference for name is {:?}", name_reference);
+            assert_eq!(name, person.name);
+            let occupation_bytes = file.get_entry_bytes(occupation_reference).unwrap();
+            let occupation = std::str::from_utf8(occupation_bytes.data_byte_range(..))
+                .unwrap()
+                .to_owned();
+            assert_eq!(occupation, person.occupation);
+            let new_person = Person { name, occupation };
+            assert_eq!(new_person, person);
         }
     }
 }
