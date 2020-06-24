@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::rc::{Rc, Weak};
 
 use thiserror::Error;
 
@@ -60,6 +61,12 @@ pub enum SlottedPageError {
 
     #[error("Insufficient space for request. `{0}` requested, but `{1}` available")]
     InsufficientSpace(usize, usize),
+
+    #[error(transparent)]
+    SerializationError(anyhow::Error),
+
+    #[error(transparent)]
+    DeserializationError(anyhow::Error),
 }
 
 type Result<T> = std::result::Result<T, SlottedPageError>;
@@ -341,18 +348,22 @@ impl<'a> ByteRange<'a> {
         &self.data_bytes
     }
 
-    pub fn split_at(&mut self, reference_position: usize, data_position: usize) -> Self {
+    pub fn split_at(self, reference_position: usize, data_position: usize) -> (Self, Self) {
         let (new_data_bytes, split_data_bytes) = self.data_bytes.split_at(data_position);
-        self.data_bytes = new_data_bytes;
         let (split_reference_bytes, new_reference_bytes) = self
             .reference_bytes
             .split_at(reference_position * TupleID::SERIALIZED_SIZE);
-        self.reference_bytes = new_reference_bytes;
 
-        Self {
-            reference_bytes: split_reference_bytes,
-            data_bytes: split_data_bytes,
-        }
+        (
+            Self {
+                reference_bytes: new_reference_bytes,
+                data_bytes: new_data_bytes,
+            },
+            Self {
+                reference_bytes: split_reference_bytes,
+                data_bytes: split_data_bytes,
+            },
+        )
     }
 }
 
@@ -727,6 +738,755 @@ impl<S: SegmentController> Drop for NaivePageController<S> {
     }
 }
 
+pub trait Serialize {
+    fn data_length(&self) -> usize;
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()>;
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()>;
+
+    fn serialize<S: SegmentController>(
+        &self,
+        file: &mut NaivePageController<S>,
+    ) -> Result<TupleID> {
+        // Behaviour of serialize
+        // 1) Calculate the total structure size by summing each field's size.
+        // 2) Loop through each field and serialize references to TupleIDs.
+        // 3) Get a guard for the total size.
+        // 4) Add all the references to the guard.
+        // 5) Add all the data.
+        // 6) Commit the guard to get a resultant TupleID.
+        // The easy way involves an allocation for all of the tuple id's, but we should investigate
+        // a way to avoid this. This would basically entail having backing page not borrow file
+        // mutably which might be possible through atomics. OTOH we might not want to do this to
+        // ensure that we can bound memory resources.
+        let mut references = Vec::new();
+        let data_length = self.data_length();
+        self.serialize_references(file, &mut references)?;
+        let mut guard = file.reserve_space(references.len(), data_length)?;
+        for tuple_id in references.drain(..) {
+            guard.add_reference(tuple_id)?;
+        }
+        self.serialize_data(&mut guard)?;
+        Ok(guard.commit())
+    }
+}
+
+pub trait Deserialize: Sized {
+    type LazyType;
+
+    fn deserialize<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        tuple: TupleID,
+    ) -> Result<Self> {
+        let lazy = Self::deserialize_from_bytes(file.get_entry_bytes(tuple)?)?;
+        Self::deserialize_from_lazy_type(file, lazy)
+    }
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType>;
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self>;
+}
+
+impl Serialize for bool {
+    fn data_length(&self) -> usize {
+        1
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(1)?[0] = *self as u8;
+        Ok(())
+    }
+}
+
+impl Deserialize for bool {
+    type LazyType = bool;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        if bytes[0] == 0 {
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for u8 {
+    fn data_length(&self) -> usize {
+        1
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(1)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for u8 {
+    type LazyType = u8;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(u8::from_le_bytes([bytes[0]]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for u16 {
+    fn data_length(&self) -> usize {
+        2
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(2)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for u16 {
+    type LazyType = u16;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for u32 {
+    fn data_length(&self) -> usize {
+        4
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(4)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for u32 {
+    type LazyType = u32;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for u64 {
+    fn data_length(&self) -> usize {
+        8
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for u64 {
+    type LazyType = u64;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for usize {
+    fn data_length(&self) -> usize {
+        8
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for usize {
+    type LazyType = usize;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(usize::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for i8 {
+    fn data_length(&self) -> usize {
+        1
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(1)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for i8 {
+    type LazyType = i8;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(i8::from_le_bytes([bytes[0]]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for i16 {
+    fn data_length(&self) -> usize {
+        2
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(2)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for i16 {
+    type LazyType = i16;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for i32 {
+    fn data_length(&self) -> usize {
+        4
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(4)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for i32 {
+    type LazyType = i32;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for i64 {
+    fn data_length(&self) -> usize {
+        8
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for i64 {
+    type LazyType = i64;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(i64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for isize {
+    fn data_length(&self) -> usize {
+        8
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for isize {
+    type LazyType = isize;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(isize::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for f32 {
+    fn data_length(&self) -> usize {
+        4
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(4)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for f32 {
+    type LazyType = f32;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for f64 {
+    fn data_length(&self) -> usize {
+        8
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for f64 {
+    type LazyType = f64;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(f64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for char {
+    fn data_length(&self) -> usize {
+        self.len_utf8()
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        self.encode_utf8(guard.reserve_space(self.data_length())?);
+        Ok(())
+    }
+}
+
+impl Deserialize for char {
+    type LazyType = char;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(std::str::from_utf8(bytes)
+            .map_err(|x| SlottedPageError::SerializationError(x.into()))?
+            .chars()
+            .next()
+            .unwrap())
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl Serialize for str {
+    fn data_length(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard
+            .reserve_space(self.data_length())?
+            .copy_from_slice(&self.as_bytes());
+        Ok(())
+    }
+}
+
+impl Serialize for String {
+    fn data_length(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+        guard
+            .reserve_space(self.data_length())?
+            .copy_from_slice(&self.as_bytes());
+        Ok(())
+    }
+}
+
+impl Deserialize for String {
+    type LazyType = String;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let bytes = bytes.data_bytes();
+        Ok(std::str::from_utf8(bytes)
+            .map_err(|x| SlottedPageError::SerializationError(x.into()))?
+            .to_owned())
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
+impl<T: Serialize> Serialize for Box<T> {
+    fn data_length(&self) -> usize {
+        0
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        references.push(self.as_ref().serialize(file)?);
+        Ok(())
+    }
+
+    fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<T: Deserialize> Deserialize for Box<T> {
+    type LazyType = TupleID;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let reference = bytes.reference(0).unwrap();
+        Ok(reference)
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(Box::new(T::deserialize(file, lazy)?))
+    }
+}
+
+impl<T: Serialize> Serialize for Rc<T> {
+    fn data_length(&self) -> usize {
+        0
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        references.push(self.as_ref().serialize(file)?);
+        Ok(())
+    }
+
+    fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<T: Deserialize> Deserialize for Rc<T> {
+    type LazyType = TupleID;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let reference = bytes.reference(0).unwrap();
+        Ok(reference)
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(Rc::new(T::deserialize(file, lazy)?))
+    }
+}
+
+impl<T: Serialize> Serialize for Weak<T> {
+    fn data_length(&self) -> usize {
+        0
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        references.push(self.upgrade().unwrap().as_ref().serialize(file)?);
+        Ok(())
+    }
+
+    fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Serialize for TupleID {
+    fn data_length(&self) -> usize {
+        0
+    }
+
+    fn serialize_references<'a, S: SegmentController>(
+        &self,
+        file: &'a mut NaivePageController<S>,
+        references: &mut Vec<TupleID>,
+    ) -> Result<()> {
+        references.push(*self);
+        Ok(())
+    }
+
+    fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Deserialize for TupleID {
+    type LazyType = TupleID;
+
+    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+        let reference = bytes.reference(0).unwrap();
+        Ok(reference)
+    }
+
+    fn deserialize_from_lazy_type<S: SegmentController>(
+        file: &mut NaivePageController<S>,
+        lazy: Self::LazyType,
+    ) -> Result<Self> {
+        Ok(lazy)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,6 +1739,237 @@ mod tests {
 
     #[test]
     fn test_complex_reference() {
+        let person = Person {
+            name: "alice".to_owned(),
+            occupation: "blacksmith".to_owned(),
+        };
+
+        let mut bytes = Vec::new();
+        let (root_reference, name_reference, occupation_reference) = {
+            let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+            let mut guard = file.reserve_space(0, person.name.len()).unwrap();
+            guard
+                .remaining_data_bytes()
+                .copy_from_slice(&person.name.as_bytes());
+            let name_reference = guard.commit();
+            let mut guard = file.reserve_space(0, person.occupation.len()).unwrap();
+            guard
+                .remaining_data_bytes()
+                .copy_from_slice(&person.occupation.as_bytes());
+            let occupation_reference = guard.commit();
+            let mut guard = file.reserve_space(2, 0).unwrap();
+            guard.add_reference(name_reference).unwrap();
+            guard.add_reference(occupation_reference).unwrap();
+            (guard.commit(), name_reference, occupation_reference)
+        };
+        {
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let entry_bytes = file.get_entry_bytes(root_reference).unwrap();
+            assert_eq!(
+                entry_bytes.references().collect::<Vec<_>>(),
+                vec![name_reference, occupation_reference]
+            );
+            let input_name_reference = entry_bytes.reference(0).unwrap();
+            assert_eq!(input_name_reference, name_reference);
+            let input_occupation_reference = entry_bytes.reference(1).unwrap();
+            assert_eq!(input_occupation_reference, occupation_reference);
+            let name_bytes = file.get_entry_bytes(name_reference).unwrap();
+            let name = std::str::from_utf8(name_bytes.data_bytes())
+                .unwrap()
+                .to_owned();
+            assert_eq!(name, person.name);
+            let occupation_bytes = file.get_entry_bytes(occupation_reference).unwrap();
+            let occupation = std::str::from_utf8(occupation_bytes.data_bytes())
+                .unwrap()
+                .to_owned();
+            assert_eq!(occupation, person.occupation);
+            let new_person = Person { name, occupation };
+            assert_eq!(new_person, person);
+        }
+    }
+
+    #[test]
+    fn single_serialize() {
+        let mut bytes = Vec::new();
+        let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+        let tuple_id = 5usize.serialize(&mut file).unwrap();
+        let entry = usize::deserialize(&mut file, tuple_id).unwrap();
+        assert_eq!(entry, 5);
+    }
+
+    #[test]
+    fn multiple_serialize() {
+        let mut bytes = Vec::new();
+
+        let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+        let tuple_5 = 5usize.serialize(&mut file).unwrap();
+        let tuple_900 = 900usize.serialize(&mut file).unwrap();
+        let tuple_roflpi = "roflpi".serialize(&mut file).unwrap();
+
+        let entry_5 = usize::deserialize(&mut file, tuple_5).unwrap();
+        assert_eq!(entry_5, 5);
+        let entry_900 = usize::deserialize(&mut file, tuple_900).unwrap();
+        assert_eq!(entry_900, 900);
+        let entry_roflpi = String::deserialize(&mut file, tuple_roflpi).unwrap();
+        assert_eq!(entry_roflpi, "roflpi");
+    }
+
+    #[test]
+    fn large_serialize() {
+        let mut bytes = Vec::new();
+        let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+        let tuple_id = "lol".repeat(10000).serialize(&mut file).unwrap();
+        let entry = String::deserialize(&mut file, tuple_id).unwrap();
+        assert_eq!(entry, "lol".repeat(10000));
+    }
+
+    #[test]
+    fn single_reference_serialize() {
+        let mut bytes = Vec::new();
+        let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+        let tuple_id = Box::new(5usize).serialize(&mut file).unwrap();
+        let entry: Box<usize> = Box::deserialize(&mut file, tuple_id).unwrap();
+        assert_eq!(entry.as_ref(), &5);
+    }
+
+    #[test]
+    fn double_reference_serialize() {
+        let mut bytes = Vec::new();
+        let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+        let num_id = 5.serialize(&mut file).unwrap();
+        let ref1 = num_id.serialize(&mut file).unwrap();
+        let ref2 = num_id.serialize(&mut file).unwrap();
+        assert_ne!(ref1, ref2);
+        let ref_1_val = TupleID::deserialize(&mut file, ref1).unwrap();
+        let ref_2_val = TupleID::deserialize(&mut file, ref2).unwrap();
+        assert_eq!(ref_1_val, ref_2_val);
+        let entry = i32::deserialize(&mut file, ref_1_val).unwrap();
+        assert_eq!(entry, 5);
+    }
+
+    #[test]
+    fn single_reference_with_large_serialize() {
+        let mut bytes = Vec::new();
+        let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+        let large_id = "lol".repeat(10000).serialize(&mut file).unwrap();
+        let reference_id = large_id.serialize(&mut file).unwrap();
+        assert_ne!(large_id, reference_id);
+
+        let reference_value = TupleID::deserialize(&mut file, reference_id).unwrap();
+        assert_eq!(reference_value, large_id);
+
+        let large_value = String::deserialize(&mut file, reference_value).unwrap();
+        assert_eq!(large_value, "lol".repeat(10000));
+    }
+
+    #[test]
+    fn test_complex_serialize() {
+        impl Serialize for Person {
+            fn data_length(&self) -> usize {
+                8 + self.name.len() + self.occupation.len()
+            }
+
+            fn serialize_references<'a, S: SegmentController>(
+                &self,
+                file: &'a mut NaivePageController<S>,
+                references: &mut Vec<TupleID>,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+                self.name.len().serialize_data(guard)?;
+                self.name.serialize_data(guard)?;
+                self.occupation.serialize_data(guard)
+            }
+        }
+
+        impl Deserialize for Person {
+            type LazyType = Person;
+
+            fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+                // Need way to deserialize sub entries from the relevant things.
+                let (name_len_range, remaining) = bytes.split_at(0, 8);
+                let name_len = usize::deserialize_from_bytes(name_len_range)?;
+                let (name_range, occupation_range) = remaining.split_at(0, name_len);
+                let name = String::deserialize_from_bytes(name_range)?;
+                let occupation = String::deserialize_from_bytes(occupation_range)?;
+                Ok(Person { name, occupation })
+            }
+
+            fn deserialize_from_lazy_type<S: SegmentController>(
+                file: &mut NaivePageController<S>,
+                lazy: Self::LazyType,
+            ) -> Result<Self> {
+                Ok(lazy)
+            }
+        }
+        let person = Person {
+            name: "alice".to_owned(),
+            occupation: "blacksmith".to_owned(),
+        };
+
+        let mut bytes = Vec::new();
+        let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
+        let person_id = person.serialize(&mut file).unwrap();
+        let entry = Person::deserialize(&mut file, person_id).unwrap();
+        assert_eq!(entry, person);
+    }
+
+    #[test]
+    fn test_complex_reference_serialize() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Person {
+            name: String,
+            occupation: String,
+        }
+
+        struct LazyPerson {
+            name: TupleID,
+            occupation: TupleID,
+        }
+
+        impl Serialize for Person {
+            fn data_length(&self) -> usize {
+                0
+            }
+
+            fn serialize_references<'a, S: SegmentController>(
+                &self,
+                file: &'a mut NaivePageController<S>,
+                references: &mut Vec<TupleID>,
+            ) -> Result<()> {
+                references.push(self.name.serialize(file)?);
+                references.push(self.occupation.serialize(file)?);
+                Ok(())
+            }
+
+            fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Deserialize for Person {
+            type LazyType = LazyPerson;
+
+            fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+                // Need way to deserialize sub entries from the relevant things.
+                let name = bytes.reference(0).unwrap();
+                let occupation = bytes.reference(1).unwrap();
+                Ok(LazyPerson { name, occupation })
+            }
+
+            fn deserialize_from_lazy_type<S: SegmentController>(
+                file: &mut NaivePageController<S>,
+                lazy: Self::LazyType,
+            ) -> Result<Self> {
+                Ok(Person {
+                    name: String::deserialize(file, lazy.name)?,
+                    occupation: String::deserialize(file, lazy.occupation)?,
+                })
+            }
+        }
+
         let person = Person {
             name: "alice".to_owned(),
             occupation: "blacksmith".to_owned(),

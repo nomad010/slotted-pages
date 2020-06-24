@@ -28,3 +28,4 @@
   Verdict: Nope.
 [] Replace marker with a checksum in the page.
 [] Remove SegmentController trait with just Write + Read + Seek Bounds
+[] Add Serialize/Deserialize Traits and Lazy struct
