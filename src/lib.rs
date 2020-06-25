@@ -1,7 +1,9 @@
 use std::borrow::Cow;
+use std::convert::{TryFrom, TryInto};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::rc::{Rc, Weak};
 
+use anyhow::anyhow;
 use thiserror::Error;
 
 const SEGMENT_SIZE: usize = 4096;
@@ -738,6 +740,15 @@ impl<S: SegmentController> Drop for NaivePageController<S> {
     }
 }
 
+pub trait Loadable {
+    type LoadType;
+
+    fn load<S: SegmentController>(
+        self,
+        file: &mut NaivePageController<S>,
+    ) -> Result<Self::LoadType>;
+}
+
 pub trait Serialize {
     fn data_length(&self) -> usize;
 
@@ -776,23 +787,63 @@ pub trait Serialize {
     }
 }
 
+pub struct LoadNotNecessary<T: for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>> {
+    inner: T,
+}
+
+impl<T: for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>> Loadable for LoadNotNecessary<T> {
+    type LoadType = T;
+
+    fn load<S: SegmentController>(
+        self,
+        _file: &mut NaivePageController<S>,
+    ) -> Result<Self::LoadType> {
+        Ok(self.inner)
+    }
+}
+
+impl<'b, T: for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>> TryFrom<ByteRange<'b>>
+    for LoadNotNecessary<T>
+{
+    type Error = anyhow::Error;
+
+    fn try_from(t: ByteRange<'b>) -> std::result::Result<Self, anyhow::Error> {
+        Ok(LoadNotNecessary {
+            inner: T::try_from(t)?,
+        })
+    }
+}
+
+pub struct TypedTupleId<T: Deserialize> {
+    tuple: TupleID,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: Deserialize> Loadable for TypedTupleId<T> {
+    type LoadType = T;
+
+    fn load<S: SegmentController>(
+        self,
+        file: &mut NaivePageController<S>,
+    ) -> Result<Self::LoadType> {
+        T::deserialize(file, self.tuple)
+    }
+}
+
+// Restructure to build on the lazy motif.
 pub trait Deserialize: Sized {
-    type LazyType;
+    type LoadType: Loadable<LoadType = Self> + for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>;
 
     fn deserialize<S: SegmentController>(
         file: &mut NaivePageController<S>,
         tuple: TupleID,
     ) -> Result<Self> {
-        let lazy = Self::deserialize_from_bytes(file.get_entry_bytes(tuple)?)?;
-        Self::deserialize_from_lazy_type(file, lazy)
+        let x: Self::LoadType = file
+            .get_entry_bytes(tuple)?
+            .try_into()
+            .map_err(|x: anyhow::Error| SlottedPageError::DeserializationError(x.into()))?;
+        x.load(file)
     }
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType>;
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self>;
 }
 
 impl Serialize for bool {
@@ -802,8 +853,8 @@ impl Serialize for bool {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -814,23 +865,27 @@ impl Serialize for bool {
     }
 }
 
-impl Deserialize for bool {
-    type LazyType = bool;
+impl<'a> TryFrom<ByteRange<'a>> for bool {
+    type Error = anyhow::Error;
 
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        if bytes[0] == 0 {
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        if value.data_bytes()[0] == 0 {
             Ok(false)
         } else {
             Ok(true)
         }
     }
+}
 
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
+impl Deserialize for bool {
+    type LoadType = LoadNotNecessary<bool>;
+}
+
+impl<'a> TryFrom<ByteRange<'a>> for u8 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(value.data_bytes()[0])
     }
 }
 
@@ -841,8 +896,8 @@ impl Serialize for u8 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -854,19 +909,7 @@ impl Serialize for u8 {
 }
 
 impl Deserialize for u8 {
-    type LazyType = u8;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(u8::from_le_bytes([bytes[0]]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<u8>;
 }
 
 impl Serialize for u16 {
@@ -876,8 +919,8 @@ impl Serialize for u16 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -888,20 +931,18 @@ impl Serialize for u16 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for u16 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for u16 {
-    type LazyType = u16;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<u16>;
 }
 
 impl Serialize for u32 {
@@ -911,8 +952,8 @@ impl Serialize for u32 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -923,20 +964,18 @@ impl Serialize for u32 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for u32 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for u32 {
-    type LazyType = u32;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<u32>;
 }
 
 impl Serialize for u64 {
@@ -946,8 +985,8 @@ impl Serialize for u64 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -958,22 +997,18 @@ impl Serialize for u64 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for u64 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for u64 {
-    type LazyType = u64;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<u64>;
 }
 
 impl Serialize for usize {
@@ -983,8 +1018,8 @@ impl Serialize for usize {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -995,22 +1030,18 @@ impl Serialize for usize {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for usize {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for usize {
-    type LazyType = usize;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(usize::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<usize>;
 }
 
 impl Serialize for i8 {
@@ -1020,8 +1051,8 @@ impl Serialize for i8 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1032,20 +1063,18 @@ impl Serialize for i8 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for i8 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for i8 {
-    type LazyType = i8;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(i8::from_le_bytes([bytes[0]]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<i8>;
 }
 
 impl Serialize for i16 {
@@ -1055,8 +1084,8 @@ impl Serialize for i16 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1067,20 +1096,18 @@ impl Serialize for i16 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for i16 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for i16 {
-    type LazyType = i16;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<i16>;
 }
 
 impl Serialize for i32 {
@@ -1090,8 +1117,8 @@ impl Serialize for i32 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1102,20 +1129,18 @@ impl Serialize for i32 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for i32 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for i32 {
-    type LazyType = i32;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<i32>;
 }
 
 impl Serialize for i64 {
@@ -1125,8 +1150,8 @@ impl Serialize for i64 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1137,22 +1162,18 @@ impl Serialize for i64 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for i64 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for i64 {
-    type LazyType = i64;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(i64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<i64>;
 }
 
 impl Serialize for isize {
@@ -1162,8 +1183,8 @@ impl Serialize for isize {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1174,22 +1195,18 @@ impl Serialize for isize {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for isize {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for isize {
-    type LazyType = isize;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(isize::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<isize>;
 }
 
 impl Serialize for f32 {
@@ -1199,8 +1216,8 @@ impl Serialize for f32 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1211,20 +1228,18 @@ impl Serialize for f32 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for f32 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for f32 {
-    type LazyType = f32;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<f32>;
 }
 
 impl Serialize for f64 {
@@ -1234,8 +1249,8 @@ impl Serialize for f64 {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1246,22 +1261,18 @@ impl Serialize for f64 {
     }
 }
 
+impl<'a> TryFrom<ByteRange<'a>> for f64 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::from_le_bytes(value.data_bytes().try_into().map_err(
+            |_| SlottedPageError::DeserializationError(anyhow!("Unexpected bytes size")),
+        )?))
+    }
+}
+
 impl Deserialize for f64 {
-    type LazyType = f64;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
-        Ok(f64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+    type LoadType = LoadNotNecessary<f64>;
 }
 
 impl Serialize for char {
@@ -1271,8 +1282,8 @@ impl Serialize for char {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1283,24 +1294,21 @@ impl Serialize for char {
     }
 }
 
-impl Deserialize for char {
-    type LazyType = char;
+impl<'a> TryFrom<ByteRange<'a>> for char {
+    type Error = anyhow::Error;
 
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        let bytes = value.data_bytes();
         Ok(std::str::from_utf8(bytes)
             .map_err(|x| SlottedPageError::SerializationError(x.into()))?
             .chars()
             .next()
             .unwrap())
     }
+}
 
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+impl Deserialize for char {
+    type LoadType = LoadNotNecessary<char>;
 }
 
 impl Serialize for str {
@@ -1310,8 +1318,8 @@ impl Serialize for str {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1331,8 +1339,8 @@ impl Serialize for String {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
-        references: &mut Vec<TupleID>,
+        _file: &'a mut NaivePageController<S>,
+        _references: &mut Vec<TupleID>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1345,22 +1353,19 @@ impl Serialize for String {
     }
 }
 
-impl Deserialize for String {
-    type LazyType = String;
+impl<'a> TryFrom<ByteRange<'a>> for String {
+    type Error = anyhow::Error;
 
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let bytes = bytes.data_bytes();
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        let bytes = value.data_bytes();
         Ok(std::str::from_utf8(bytes)
             .map_err(|x| SlottedPageError::SerializationError(x.into()))?
             .to_owned())
     }
+}
 
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+impl Deserialize for String {
+    type LoadType = LoadNotNecessary<String>;
 }
 
 impl<T: Serialize> Serialize for Box<T> {
@@ -1382,19 +1387,69 @@ impl<T: Serialize> Serialize for Box<T> {
     }
 }
 
-impl<T: Deserialize> Deserialize for Box<T> {
-    type LazyType = TupleID;
+impl<'a, T: Deserialize> TryFrom<ByteRange<'a>> for TypedTupleId<T> {
+    type Error = anyhow::Error;
 
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let reference = bytes.reference(0).unwrap();
-        Ok(reference)
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        let reference = value.reference(0).unwrap();
+        Ok(TypedTupleId {
+            tuple: reference,
+            _marker: std::marker::PhantomData,
+        })
     }
+}
 
-    fn deserialize_from_lazy_type<S: SegmentController>(
+pub struct BoxedTupleID<T: Deserialize>(TypedTupleId<T>);
+
+impl<'a, T: Deserialize> TryFrom<ByteRange<'a>> for BoxedTupleID<T> {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        let reference = value.reference(0).unwrap();
+        Ok(BoxedTupleID(TypedTupleId {
+            tuple: reference,
+            _marker: std::marker::PhantomData,
+        }))
+    }
+}
+
+impl<T: Deserialize> Loadable for BoxedTupleID<T> {
+    type LoadType = Box<T>;
+
+    fn load<S: SegmentController>(
+        self,
         file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(Box::new(T::deserialize(file, lazy)?))
+    ) -> Result<Self::LoadType> {
+        Ok(Box::new(self.0.load(file)?))
+    }
+}
+
+impl<T: Deserialize> Deserialize for Box<T> {
+    type LoadType = BoxedTupleID<T>;
+}
+
+pub struct RcedTupleID<T: Deserialize>(TypedTupleId<T>);
+
+impl<'a, T: Deserialize> TryFrom<ByteRange<'a>> for RcedTupleID<T> {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        let reference = value.reference(0).unwrap();
+        Ok(RcedTupleID(TypedTupleId {
+            tuple: reference,
+            _marker: std::marker::PhantomData,
+        }))
+    }
+}
+
+impl<T: Deserialize> Loadable for RcedTupleID<T> {
+    type LoadType = Rc<T>;
+
+    fn load<S: SegmentController>(
+        self,
+        file: &mut NaivePageController<S>,
+    ) -> Result<Self::LoadType> {
+        Ok(Rc::new(self.0.load(file)?))
     }
 }
 
@@ -1418,19 +1473,7 @@ impl<T: Serialize> Serialize for Rc<T> {
 }
 
 impl<T: Deserialize> Deserialize for Rc<T> {
-    type LazyType = TupleID;
-
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let reference = bytes.reference(0).unwrap();
-        Ok(reference)
-    }
-
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(Rc::new(T::deserialize(file, lazy)?))
-    }
+    type LoadType = RcedTupleID<T>;
 }
 
 impl<T: Serialize> Serialize for Weak<T> {
@@ -1459,7 +1502,7 @@ impl Serialize for TupleID {
 
     fn serialize_references<'a, S: SegmentController>(
         &self,
-        file: &'a mut NaivePageController<S>,
+        _file: &'a mut NaivePageController<S>,
         references: &mut Vec<TupleID>,
     ) -> Result<()> {
         references.push(*self);
@@ -1471,20 +1514,17 @@ impl Serialize for TupleID {
     }
 }
 
-impl Deserialize for TupleID {
-    type LazyType = TupleID;
+impl<'a> TryFrom<ByteRange<'a>> for TupleID {
+    type Error = anyhow::Error;
 
-    fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-        let reference = bytes.reference(0).unwrap();
+    fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+        let reference = value.reference(0).unwrap();
         Ok(reference)
     }
+}
 
-    fn deserialize_from_lazy_type<S: SegmentController>(
-        file: &mut NaivePageController<S>,
-        lazy: Self::LazyType,
-    ) -> Result<Self> {
-        Ok(lazy)
-    }
+impl Deserialize for TupleID {
+    type LoadType = LoadNotNecessary<TupleID>;
 }
 
 #[cfg(test)]
@@ -1871,8 +1911,8 @@ mod tests {
 
             fn serialize_references<'a, S: SegmentController>(
                 &self,
-                file: &'a mut NaivePageController<S>,
-                references: &mut Vec<TupleID>,
+                _file: &'a mut NaivePageController<S>,
+                _references: &mut Vec<TupleID>,
             ) -> Result<()> {
                 Ok(())
             }
@@ -1884,25 +1924,22 @@ mod tests {
             }
         }
 
-        impl Deserialize for Person {
-            type LazyType = Person;
+        impl<'a> TryFrom<ByteRange<'a>> for Person {
+            type Error = anyhow::Error;
 
-            fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
+            fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
                 // Need way to deserialize sub entries from the relevant things.
-                let (name_len_range, remaining) = bytes.split_at(0, 8);
-                let name_len = usize::deserialize_from_bytes(name_len_range)?;
+                let (name_len_range, remaining) = value.split_at(0, 8);
+                let name_len = name_len_range.try_into()?;
                 let (name_range, occupation_range) = remaining.split_at(0, name_len);
-                let name = String::deserialize_from_bytes(name_range)?;
-                let occupation = String::deserialize_from_bytes(occupation_range)?;
+                let name = name_range.try_into()?;
+                let occupation = occupation_range.try_into()?;
                 Ok(Person { name, occupation })
             }
+        }
 
-            fn deserialize_from_lazy_type<S: SegmentController>(
-                file: &mut NaivePageController<S>,
-                lazy: Self::LazyType,
-            ) -> Result<Self> {
-                Ok(lazy)
-            }
+        impl Deserialize for Person {
+            type LoadType = LoadNotNecessary<Person>;
         }
         let person = Person {
             name: "alice".to_owned(),
@@ -1925,8 +1962,41 @@ mod tests {
         }
 
         struct LazyPerson {
-            name: TupleID,
-            occupation: TupleID,
+            name: TypedTupleId<String>,
+            occupation: TypedTupleId<String>,
+        }
+
+        impl<'a> TryFrom<ByteRange<'a>> for LazyPerson {
+            type Error = anyhow::Error;
+
+            fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
+                let name = value.reference(0).unwrap();
+                let occupation = value.reference(1).unwrap();
+                Ok(LazyPerson {
+                    name: TypedTupleId {
+                        tuple: name,
+                        _marker: std::marker::PhantomData,
+                    },
+                    occupation: TypedTupleId {
+                        tuple: occupation,
+                        _marker: std::marker::PhantomData,
+                    },
+                })
+            }
+        }
+
+        impl Loadable for LazyPerson {
+            type LoadType = Person;
+
+            fn load<S: SegmentController>(
+                self,
+                file: &mut NaivePageController<S>,
+            ) -> Result<Self::LoadType> {
+                Ok(Person {
+                    name: self.name.load(file)?,
+                    occupation: self.occupation.load(file)?,
+                })
+            }
         }
 
         impl Serialize for Person {
@@ -1944,30 +2014,13 @@ mod tests {
                 Ok(())
             }
 
-            fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+            fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
                 Ok(())
             }
         }
 
         impl Deserialize for Person {
-            type LazyType = LazyPerson;
-
-            fn deserialize_from_bytes(bytes: ByteRange) -> Result<Self::LazyType> {
-                // Need way to deserialize sub entries from the relevant things.
-                let name = bytes.reference(0).unwrap();
-                let occupation = bytes.reference(1).unwrap();
-                Ok(LazyPerson { name, occupation })
-            }
-
-            fn deserialize_from_lazy_type<S: SegmentController>(
-                file: &mut NaivePageController<S>,
-                lazy: Self::LazyType,
-            ) -> Result<Self> {
-                Ok(Person {
-                    name: String::deserialize(file, lazy.name)?,
-                    occupation: String::deserialize(file, lazy.occupation)?,
-                })
-            }
+            type LoadType = LazyPerson;
         }
 
         let person = Person {
