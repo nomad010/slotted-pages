@@ -125,8 +125,14 @@ impl<'a, S: SegmentController> NaivePageController<S> {
     }
 
     /// Reserves space for an item to be written. The length must be given in the number of
-    /// references and the number of data bytes required.
-    pub fn reserve_space(&'a mut self, references: usize, data_length: usize) -> Result<Guard> {
+    /// references and the number of data bytes required. Additionally, this function can be used to
+    /// set the root node of the file.
+    pub fn reserve_space(
+        &'a mut self,
+        references: usize,
+        data_length: usize,
+        set_root: bool,
+    ) -> Result<Guard> {
         let length = references * EntryID::SERIALIZED_SIZE + data_length;
         if let Some((dirty, page)) = &mut self.current_page {
             *dirty = true;
@@ -140,12 +146,17 @@ impl<'a, S: SegmentController> NaivePageController<S> {
             self.header_is_dirty = true;
             self.current_page = Some((true, Page::empty(self.header.pages as usize)));
         }
+        let file_header = if set_root {
+            Some(&mut self.header)
+        } else {
+            None
+        };
         Ok(self
             .current_page
             .as_mut()
             .unwrap()
             .1
-            .reserve_space(references, data_length)
+            .reserve_space(references, data_length, file_header)
             .unwrap())
     }
 }

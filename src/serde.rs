@@ -43,6 +43,7 @@ pub trait Serialize {
     fn serialize<S: SegmentController>(
         &self,
         file: &mut NaivePageController<S>,
+        set_root: bool,
     ) -> Result<EntryID> {
         // Behaviour of serialize
         // 1) Calculate the total structure size by summing each field's size.
@@ -58,7 +59,7 @@ pub trait Serialize {
         let mut references = Vec::new();
         let data_length = self.data_length();
         self.serialize_references(file, &mut references)?;
-        let mut guard = file.reserve_space(references.len(), data_length)?;
+        let mut guard = file.reserve_space(references.len(), data_length, set_root)?;
         for tuple_id in references.drain(..) {
             guard.add_reference(tuple_id)?;
         }
@@ -658,7 +659,7 @@ pub(crate) mod r#impl {
             file: &'a mut NaivePageController<S>,
             references: &mut Vec<EntryID>,
         ) -> Result<()> {
-            references.push(self.as_ref().serialize(file)?);
+            references.push(self.as_ref().serialize(file, false)?);
             Ok(())
         }
 
@@ -745,7 +746,7 @@ pub(crate) mod r#impl {
             file: &'a mut NaivePageController<S>,
             references: &mut Vec<EntryID>,
         ) -> Result<()> {
-            references.push(self.as_ref().serialize(file)?);
+            references.push(self.as_ref().serialize(file, false)?);
             Ok(())
         }
 
@@ -768,7 +769,7 @@ pub(crate) mod r#impl {
             file: &'a mut NaivePageController<S>,
             references: &mut Vec<EntryID>,
         ) -> Result<()> {
-            references.push(self.upgrade().unwrap().as_ref().serialize(file)?);
+            references.push(self.upgrade().unwrap().as_ref().serialize(file, false)?);
             Ok(())
         }
 
@@ -820,7 +821,7 @@ mod tests {
     fn single_serialize() {
         let mut bytes = Vec::new();
         let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-        let tuple_id = 5usize.serialize(&mut file).unwrap();
+        let tuple_id = 5usize.serialize(&mut file, true).unwrap();
         let entry = usize::deserialize(&mut file, tuple_id).unwrap();
         assert_eq!(entry, 5);
     }
@@ -830,9 +831,9 @@ mod tests {
         let mut bytes = Vec::new();
 
         let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-        let tuple_5 = 5usize.serialize(&mut file).unwrap();
-        let tuple_900 = 900usize.serialize(&mut file).unwrap();
-        let tuple_roflpi = "roflpi".serialize(&mut file).unwrap();
+        let tuple_5 = 5usize.serialize(&mut file, true).unwrap();
+        let tuple_900 = 900usize.serialize(&mut file, false).unwrap();
+        let tuple_roflpi = "roflpi".serialize(&mut file, true).unwrap();
 
         let entry_5 = usize::deserialize(&mut file, tuple_5).unwrap();
         assert_eq!(entry_5, 5);
@@ -846,7 +847,7 @@ mod tests {
     fn large_serialize() {
         let mut bytes = Vec::new();
         let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-        let tuple_id = "lol".repeat(10000).serialize(&mut file).unwrap();
+        let tuple_id = "lol".repeat(10000).serialize(&mut file, true).unwrap();
         let entry = String::deserialize(&mut file, tuple_id).unwrap();
         assert_eq!(entry, "lol".repeat(10000));
     }
@@ -855,7 +856,7 @@ mod tests {
     fn single_reference_serialize() {
         let mut bytes = Vec::new();
         let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-        let tuple_id = Box::new(5usize).serialize(&mut file).unwrap();
+        let tuple_id = Box::new(5usize).serialize(&mut file, true).unwrap();
         let entry: Box<usize> = Box::deserialize(&mut file, tuple_id).unwrap();
         assert_eq!(entry.as_ref(), &5);
     }
@@ -864,9 +865,9 @@ mod tests {
     fn double_reference_serialize() {
         let mut bytes = Vec::new();
         let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-        let num_id = 5.serialize(&mut file).unwrap();
-        let ref1 = num_id.serialize(&mut file).unwrap();
-        let ref2 = num_id.serialize(&mut file).unwrap();
+        let num_id = 5.serialize(&mut file, true).unwrap();
+        let ref1 = num_id.serialize(&mut file, false).unwrap();
+        let ref2 = num_id.serialize(&mut file, false).unwrap();
         assert_ne!(ref1, ref2);
         let ref_1_val = EntryID::deserialize(&mut file, ref1).unwrap();
         let ref_2_val = EntryID::deserialize(&mut file, ref2).unwrap();
@@ -879,8 +880,8 @@ mod tests {
     fn single_reference_with_large_serialize() {
         let mut bytes = Vec::new();
         let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-        let large_id = "lol".repeat(10000).serialize(&mut file).unwrap();
-        let reference_id = large_id.serialize(&mut file).unwrap();
+        let large_id = "lol".repeat(10000).serialize(&mut file, true).unwrap();
+        let reference_id = large_id.serialize(&mut file, true).unwrap();
         assert_ne!(large_id, reference_id);
 
         let reference_value = EntryID::deserialize(&mut file, reference_id).unwrap();
@@ -942,7 +943,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-        let person_id = person.serialize(&mut file).unwrap();
+        let person_id = person.serialize(&mut file, true).unwrap();
         let entry = Person::deserialize(&mut file, person_id).unwrap();
         assert_eq!(entry, person);
     }
@@ -1003,8 +1004,8 @@ mod tests {
                 file: &'a mut NaivePageController<S>,
                 references: &mut Vec<EntryID>,
             ) -> Result<()> {
-                references.push(self.name.serialize(file)?);
-                references.push(self.occupation.serialize(file)?);
+                references.push(self.name.serialize(file, false)?);
+                references.push(self.occupation.serialize(file, false)?);
                 Ok(())
             }
 
@@ -1025,17 +1026,19 @@ mod tests {
         let mut bytes = Vec::new();
         let (root_reference, name_reference, occupation_reference) = {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, person.name.len()).unwrap();
+            let mut guard = file.reserve_space(0, person.name.len(), false).unwrap();
             guard
                 .remaining_data_bytes()
                 .copy_from_slice(&person.name.as_bytes());
             let name_reference = guard.commit();
-            let mut guard = file.reserve_space(0, person.occupation.len()).unwrap();
+            let mut guard = file
+                .reserve_space(0, person.occupation.len(), false)
+                .unwrap();
             guard
                 .remaining_data_bytes()
                 .copy_from_slice(&person.occupation.as_bytes());
             let occupation_reference = guard.commit();
-            let mut guard = file.reserve_space(2, 0).unwrap();
+            let mut guard = file.reserve_space(2, 0, true).unwrap();
             guard.add_reference(name_reference).unwrap();
             guard.add_reference(occupation_reference).unwrap();
             (guard.commit(), name_reference, occupation_reference)

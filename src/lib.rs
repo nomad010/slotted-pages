@@ -121,6 +121,7 @@ pub struct Guard<'a> {
     entry_pointer_end_bytes: &'a mut [u8],
     new_used_space_start: u16,
     used_space_start_bytes: &'a mut [u8],
+    header_root: Option<&'a mut Option<EntryID>>,
 }
 
 impl<'a> Guard<'a> {
@@ -170,6 +171,9 @@ impl<'a> Guard<'a> {
             .copy_from_slice(&self.new_entry_pointer_end.to_le_bytes());
         self.used_space_start_bytes
             .copy_from_slice(&self.new_used_space_start.to_le_bytes());
+        if let Some(root) = self.header_root.as_mut() {
+            **root = Some(self.tuple);
+        }
     }
 
     /// Commits the changes (not necessarily to storage) and returns a reference that can be used
@@ -456,7 +460,12 @@ impl Page {
         self.free_space_slice().len().saturating_sub(3)
     }
 
-    fn reserve_space(&mut self, references: usize, length: usize) -> Option<Guard> {
+    fn reserve_space<'a>(
+        &'a mut self,
+        references: usize,
+        length: usize,
+        file_header: Option<&'a mut FileHeader>,
+    ) -> Option<Guard> {
         if self.bytes.is_empty() || self.num_entries() == 0 {
             self.resize(references, length);
             let bytes_length = self.bytes.len();
@@ -492,6 +501,7 @@ impl Page {
                 new_used_space_start: ((SEGMENT_SIZE - (total_data_size % SEGMENT_SIZE))
                     % SEGMENT_SIZE) as u16,
                 references,
+                header_root: file_header.map(|x| &mut x.root),
             })
         } else {
             let (_, remaining_bytes) = self.bytes.split_at_mut(1); // Page byte marker
@@ -535,6 +545,7 @@ impl Page {
                     new_entry_pointer_end: entry_pointer_end as u16 + 3,
                     new_used_space_start: position as u16,
                     references,
+                    header_root: file_header.map(|x| &mut x.root),
                 })
             } else {
                 None
@@ -560,7 +571,7 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, 8).unwrap();
+            let mut guard = file.reserve_space(0, 8, true).unwrap();
             guard
                 .reserve_space(8)
                 .unwrap()
@@ -584,19 +595,19 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, 8).unwrap();
+            let mut guard = file.reserve_space(0, 8, true).unwrap();
             guard
                 .reserve_space(8)
                 .unwrap()
                 .copy_from_slice(&5usize.to_le_bytes());
             guard.commit();
-            let mut guard = file.reserve_space(0, 8).unwrap();
+            let mut guard = file.reserve_space(0, 8, true).unwrap();
             guard
                 .reserve_space(8)
                 .unwrap()
                 .copy_from_slice(&900usize.to_le_bytes());
             guard.commit();
-            let mut guard = file.reserve_space(0, 6).unwrap();
+            let mut guard = file.reserve_space(0, 6, true).unwrap();
             guard
                 .reserve_space(6)
                 .unwrap()
@@ -631,7 +642,7 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, 30000).unwrap();
+            let mut guard = file.reserve_space(0, 30000, true).unwrap();
             guard
                 .reserve_space(30000)
                 .unwrap()
@@ -653,7 +664,7 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(1, 0).unwrap();
+            let mut guard = file.reserve_space(1, 0, true).unwrap();
             guard
                 .add_reference(EntryID::with_page_and_slot(1, 1))
                 .unwrap();
@@ -675,14 +686,14 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(1, 0).unwrap();
+            let mut guard = file.reserve_space(1, 0, true).unwrap();
             {
                 guard
                     .add_reference(EntryID::with_page_and_slot(1, 1))
                     .unwrap();
                 guard.commit();
             }
-            let mut guard = file.reserve_space(1, 0).unwrap();
+            let mut guard = file.reserve_space(1, 0, true).unwrap();
             guard
                 .add_reference(EntryID::with_page_and_slot(1, 2))
                 .unwrap();
@@ -709,13 +720,13 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, 30000).unwrap();
+            let mut guard = file.reserve_space(0, 30000, true).unwrap();
             guard
                 .reserve_space(30000)
                 .unwrap()
                 .copy_from_slice("lol".repeat(10000).as_bytes());
             let tuple_id = guard.commit();
-            let mut guard = file.reserve_space(1, 0).unwrap();
+            let mut guard = file.reserve_space(1, 0, false).unwrap();
             guard.add_reference(tuple_id).unwrap();
         }
         {
@@ -751,7 +762,7 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, 8 + 5 + 10).unwrap();
+            let mut guard = file.reserve_space(0, 8 + 5 + 10, true).unwrap();
             guard
                 .reserve_space(8)
                 .unwrap()
@@ -795,17 +806,19 @@ mod tests {
         let mut bytes = Vec::new();
         let (root_reference, name_reference, occupation_reference) = {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
-            let mut guard = file.reserve_space(0, person.name.len()).unwrap();
+            let mut guard = file.reserve_space(0, person.name.len(), false).unwrap();
             guard
                 .remaining_data_bytes()
                 .copy_from_slice(&person.name.as_bytes());
             let name_reference = guard.commit();
-            let mut guard = file.reserve_space(0, person.occupation.len()).unwrap();
+            let mut guard = file
+                .reserve_space(0, person.occupation.len(), false)
+                .unwrap();
             guard
                 .remaining_data_bytes()
                 .copy_from_slice(&person.occupation.as_bytes());
             let occupation_reference = guard.commit();
-            let mut guard = file.reserve_space(2, 0).unwrap();
+            let mut guard = file.reserve_space(2, 0, true).unwrap();
             guard.add_reference(name_reference).unwrap();
             guard.add_reference(occupation_reference).unwrap();
             (guard.commit(), name_reference, occupation_reference)

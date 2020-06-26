@@ -6,7 +6,7 @@
 ✔ Add in-memory representation to facilitate testing. @done(20-06-10 16:25)
 [] Add Extended representation that is safe to read from multiple sources.
 ✔ Replace serialized usizes with u64/u32 @done(20-06-14 00:05)
-[] Add more tests for complex data structures
+✔ Add more tests for complex data structures @done(20-06-27 00:01)
 [] Use separate counters for the various page metadata.
    This will make a transition to the atomic page versions easier.
    ✔ Remove the additional_segments calls - can be calculated from the bytes length. @done(20-06-14 23:52)
@@ -28,4 +28,6 @@
   Verdict: Nope.
 [] Replace marker with a checksum in the page.
 [] Remove SegmentController trait with just Write + Read + Seek Bounds
-[] Add Serialize/Deserialize Traits and Lazy struct
+✔ Add Serialize/Deserialize Traits and Lazy struct @done(20-06-27 00:01)
+[] Tests for root reference change
+[] Async branch

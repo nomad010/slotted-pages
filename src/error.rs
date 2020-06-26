@@ -1,10 +1,9 @@
 //! Contains Error types and Results that are used in the project.
 
 use crate::EntryID;
-use thiserror::Error;
 
 /// Represents the errors that are possible for the library.
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum SlottedPageError {
     /// An error that occurs when loading a file and the header could not be properly loaded.
     #[error("Malformed file header")]
@@ -35,5 +34,5 @@ pub enum SlottedPageError {
     DeserializationError(anyhow::Error),
 }
 
-/// todo
+/// The result type used to indicate an error in the library.
 pub type Result<T> = std::result::Result<T, SlottedPageError>;
