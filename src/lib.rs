@@ -1,3 +1,28 @@
+//! A simple slotted page file format for storing immutable data.
+
+//! # What is the slotted page?
+//!
+//! The slotted page format is typically used in databases as the underlying storage format for
+//! tables and indexes. The file is broken up into a series of pages and each page is made up of
+//! slots (and a small header). Entries in the file are stored in the slots. The format is useful
+//! for storing linked data such as those found in persistent trees.
+//!
+//! # Particulars for this library
+//!
+//! Each file has a root entry that can be queried and overwritten. Anything not reachable from the
+//! root entry is considered to be garbage. Garbage entries can still be loaded if requested, but
+//! they will be removed upon next compaction.
+//!
+//! There is no limit to the size of each entry, however, repeatedably inserting many large entries
+//! may cause gaps to occur. Additionally, each entry has an additional 3 bytes of overhead.
+//!
+//! There is a work-in-progress compacter that can help reduce file size without knowledge of the
+//! types that are stored in the file.
+//!
+//! Writes are not currently durable.
+
+#![deny(missing_docs)]
+
 use std::borrow::Cow;
 use std::convert::{TryFrom, TryInto};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -13,18 +38,26 @@ TODO: We should replace this marker with a checksum in the page.
 */
 const BACKING_PAGE_MARKER: u8 = 1;
 
+/// A SegmentController is just an extension on Write, Read and Seek types to load segments from
+/// files.
 pub trait SegmentController {
+    /// Read multiple segments from the source. If bytes is not a multiple of a segment size the
+    /// remainder of the buffer will not be written to.
     fn read_segments_into(&mut self, start_segment_id: usize, bytes: &mut [u8]) -> Result<()>;
 
+    /// A helper function to load a single segment into a fixed array.
     fn read_segment(&mut self, segment_id: usize) -> Result<[u8; SEGMENT_SIZE]> {
         let mut bytes = [0; SEGMENT_SIZE];
         self.read_segments_into(segment_id, &mut bytes)?;
         Ok(bytes)
     }
 
+    /// Writes multiple segments into the source at the given start segment. Only whole segments
+    /// will be written to the sink.
     fn write_segments(&mut self, start_segment_id: usize, bytes: &[u8]) -> Result<()>;
 }
 
+/// Implements the helper code for Write + Read + Seek types.
 impl<T> SegmentController for T
 where
     T: Write + Read + Seek,
@@ -47,36 +80,45 @@ where
     }
 }
 
+/// Represents the errors that are possible for the library.
 #[derive(Error, Debug)]
 pub enum SlottedPageError {
+    /// An error that occurs when loading a file and the header could not be properly loaded.
     #[error("Malformed file header")]
     MalformedFileHeader,
 
+    /// An error when trying to load a page not known by the library or is corrupt.
     #[error("Unknown page type")]
     UnknownPageType(u8),
 
+    /// This is returned when the underlying storage mechanism fails.
     #[error(transparent)]
     IOError(#[from] std::io::Error),
 
+    /// An error for trying to load an nonexistant entry.
     #[error("Entry `{}` not found on page `{}`", .0.slot, .0.page)]
     NotFound(TupleID),
 
+    /// More memory was requested than a guard had available.
     #[error("Insufficient space for request. `{0}` requested, but `{1}` available")]
     InsufficientSpace(usize, usize),
 
+    /// An error occurred during serialization.
     #[error(transparent)]
     SerializationError(anyhow::Error),
 
+    /// An error occurred during deserialization.
     #[error(transparent)]
     DeserializationError(anyhow::Error),
 }
 
 type Result<T> = std::result::Result<T, SlottedPageError>;
 
+/// An address within the file that can be used to load an entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TupleID {
-    pub page: usize,
-    pub slot: usize,
+    page: usize,
+    slot: usize,
 }
 
 impl TupleID {
@@ -86,69 +128,37 @@ impl TupleID {
         TupleID { page, slot }
     }
 
-    pub fn to_le_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+    fn to_le_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
         let mut result = [0; Self::SERIALIZED_SIZE];
         result[..8].copy_from_slice(&(self.page as u64).to_le_bytes());
         result[8..].copy_from_slice(&(self.slot as u16).to_le_bytes());
         result
     }
 
-    pub fn to_ne_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
-        let mut result = [0; Self::SERIALIZED_SIZE];
-        result[..8].copy_from_slice(&self.page.to_ne_bytes());
-        result[8..].copy_from_slice(&(self.slot as u16).to_ne_bytes());
-        result
-    }
-
-    pub fn to_be_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
-        let mut result = [0; Self::SERIALIZED_SIZE];
-        result[..8].copy_from_slice(&self.page.to_be_bytes());
-        result[8..].copy_from_slice(&(self.slot as u16).to_be_bytes());
-        result
-    }
-
-    pub fn from_le_bytes(bytes: [u8; Self::SERIALIZED_SIZE]) -> Self {
+    fn from_le_bytes(bytes: [u8; Self::SERIALIZED_SIZE]) -> Self {
         TupleID::with_page_and_slot(
-            u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]) as usize,
-            u16::from_le_bytes([bytes[8], bytes[9]]) as usize,
-        )
-    }
-
-    pub fn from_ne_bytes(bytes: [u8; Self::SERIALIZED_SIZE]) -> Self {
-        TupleID::with_page_and_slot(
-            u64::from_ne_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]) as usize,
-            u16::from_ne_bytes([bytes[8], bytes[9]]) as usize,
-        )
-    }
-
-    pub fn from_be_bytes(bytes: [u8; Self::SERIALIZED_SIZE]) -> Self {
-        TupleID::with_page_and_slot(
-            u64::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]) as usize,
-            u16::from_be_bytes([bytes[8], bytes[9]]) as usize,
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize,
+            u16::from_le_bytes(bytes[8..].try_into().unwrap()) as usize,
         )
     }
 }
 
+/// A file header to keep various statistics on the file and its entries.
 pub struct FileHeader {
     pages: usize,
+    /// The root tuple id of the file.
     pub root: Option<TupleID>,
 }
 
 impl FileHeader {
-    pub fn new() -> Self {
+    fn new() -> Self {
         FileHeader {
             pages: 0,
             root: None,
         }
     }
 
-    pub fn from_bytes(bytes: [u8; SEGMENT_SIZE]) -> Result<Self> {
+    fn from_bytes(bytes: [u8; SEGMENT_SIZE]) -> Result<Self> {
         if bytes.starts_with(b"MAGIC") {
             let pages = u64::from_ne_bytes([
                 bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
@@ -167,7 +177,7 @@ impl FileHeader {
         }
     }
 
-    pub fn to_bytes(&self) -> [u8; SEGMENT_SIZE] {
+    fn to_bytes(&self) -> [u8; SEGMENT_SIZE] {
         let mut bytes = [0u8; SEGMENT_SIZE];
         bytes[0..5].copy_from_slice(b"MAGIC");
         bytes[5..13].copy_from_slice(&(self.pages as u64).to_le_bytes());
@@ -175,8 +185,9 @@ impl FileHeader {
     }
 }
 
+/// A guard for writing data that safely updates the relevant items once committed.
 #[derive(Debug)]
-pub struct BackingPageGuard<'a> {
+pub struct Guard<'a> {
     tuple: TupleID,
     data_bytes: *mut u8,
     data_length: usize,
@@ -187,13 +198,9 @@ pub struct BackingPageGuard<'a> {
     used_space_start_bytes: &'a mut [u8],
 }
 
-impl<'a> BackingPageGuard<'a> {
-    pub fn tuple_id(&self) -> TupleID {
-        self.tuple
-    }
-
+impl<'a> Guard<'a> {
+    /// Adds a reference to the guard.
     pub fn add_reference(&mut self, tuple_id: TupleID) -> Result<()> {
-        // TODO: Add reference is overwriting the next value's initial bytes.
         let serialized_reference = tuple_id.to_le_bytes();
         let data_bytes =
             unsafe { std::slice::from_raw_parts_mut(self.data_bytes, self.data_length) };
@@ -211,6 +218,7 @@ impl<'a> BackingPageGuard<'a> {
         }
     }
 
+    /// Reserves an amount of data bytes from the guard.
     pub fn reserve_space(&mut self, size: usize) -> Result<&mut [u8]> {
         let available = self.data_length - self.references * TupleID::SERIALIZED_SIZE;
         let data_bytes =
@@ -224,6 +232,7 @@ impl<'a> BackingPageGuard<'a> {
         }
     }
 
+    /// Reserves all the remaining data bytes from the guard.
     pub fn remaining_data_bytes(&mut self) -> &mut [u8] {
         let available = self.data_length - self.references * TupleID::SERIALIZED_SIZE;
         let data_bytes = unsafe { std::slice::from_raw_parts_mut(self.data_bytes, available) };
@@ -238,17 +247,20 @@ impl<'a> BackingPageGuard<'a> {
             .copy_from_slice(&self.new_used_space_start.to_le_bytes());
     }
 
+    /// Commits the changes (not necessarily to storage) and returns a reference that can be used
+    /// to reload the entry.
     pub fn commit(self) -> TupleID {
         self.tuple
     }
 }
 
-impl<'a> Drop for BackingPageGuard<'a> {
+impl<'a> Drop for Guard<'a> {
     fn drop(&mut self) {
         self.inner_commit();
     }
 }
 
+/// An iterator over the references that are available in a ByteRange.
 pub struct ByteRangeReferenceIter<'a> {
     bytes: &'a [u8],
     front: usize,
@@ -310,13 +322,14 @@ impl<'a> DoubleEndedIterator for ByteRangeReferenceIter<'a> {
 
 impl<'a> ExactSizeIterator for ByteRangeReferenceIter<'a> {}
 
+/// Represents the data and references that are stored for a entry.
 pub struct ByteRange<'a> {
     data_bytes: &'a [u8],
     reference_bytes: &'a [u8],
 }
 
 impl<'a> ByteRange<'a> {
-    pub fn from_bytes(bytes: &'a [u8], references: usize) -> Self {
+    fn from_bytes(bytes: &'a [u8], references: usize) -> Self {
         let reference_start = bytes.len() - TupleID::SERIALIZED_SIZE * references;
         let (data_bytes, reference_bytes) = bytes.split_at(reference_start);
         ByteRange {
@@ -325,6 +338,7 @@ impl<'a> ByteRange<'a> {
         }
     }
 
+    /// Gets the reference at the given index in the byte range.
     pub fn reference(&self, index: usize) -> Option<TupleID> {
         let reference_end = self.reference_bytes.len() - index * TupleID::SERIALIZED_SIZE;
         let bytes = &self.reference_bytes[reference_end - TupleID::SERIALIZED_SIZE..reference_end];
@@ -338,6 +352,7 @@ impl<'a> ByteRange<'a> {
         }
     }
 
+    /// Returns an iterator over the references in the byte range.
     pub fn references(&self) -> ByteRangeReferenceIter<'a> {
         ByteRangeReferenceIter {
             bytes: self.reference_bytes,
@@ -346,10 +361,12 @@ impl<'a> ByteRange<'a> {
         }
     }
 
+    /// Returns the data bytes in the byte range.
     pub fn data_bytes(&self) -> &[u8] {
         &self.data_bytes
     }
 
+    /// Splits the byte range into two byte ranges at the given position.
     pub fn split_at(self, reference_position: usize, data_position: usize) -> (Self, Self) {
         let (new_data_bytes, split_data_bytes) = self.data_bytes.split_at(data_position);
         let (split_reference_bytes, new_reference_bytes) = self
@@ -378,7 +395,7 @@ impl<'a> ByteRange<'a> {
 // Position is 12 bytes for exact positioning
 // Size is 8 bits: 255 means the size that is kept in the first 2 bytes of the payload
 // Reference counter is 4 bits: 15 means the number is kept in the first 8 bytes of the payload
-pub struct Page {
+struct Page {
     page_id: usize,
     bytes: Vec<u8>,
 }
@@ -397,7 +414,7 @@ impl Page {
         Ok(Page { page_id, bytes })
     }
 
-    pub fn total_required_size(data: usize, references: usize) -> (usize, bool, bool) {
+    fn total_required_size(data: usize, references: usize) -> (usize, bool, bool) {
         let mut size = data + TupleID::SERIALIZED_SIZE * references;
         let mut has_extra_size = false;
         if size >= 255 {
@@ -412,7 +429,7 @@ impl Page {
         (size, has_extra_size, has_extra_references)
     }
 
-    pub fn to_entry(position: usize, size: usize, references: usize) -> ([u8; 3], bool, bool) {
+    fn to_entry(position: usize, size: usize, references: usize) -> ([u8; 3], bool, bool) {
         assert!(position < SEGMENT_SIZE);
         assert!(size < SEGMENT_SIZE);
 
@@ -471,11 +488,11 @@ impl Page {
         Cow::Borrowed(&self.bytes)
     }
 
-    pub fn entry_pointer_end(&self) -> usize {
+    fn entry_pointer_end(&self) -> usize {
         u16::from_ne_bytes([self.bytes[3], self.bytes[4]]) as usize
     }
 
-    pub fn num_entries(&self) -> usize {
+    fn num_entries(&self) -> usize {
         (self.entry_pointer_end() - 7) / 3
     }
 
@@ -526,7 +543,7 @@ impl Page {
         })
     }
 
-    pub fn used_space_start(&self) -> usize {
+    fn used_space_start(&self) -> usize {
         if self.num_entries() == 0 {
             self.bytes.len()
         } else {
@@ -542,7 +559,7 @@ impl Page {
         self.free_space_slice().len().saturating_sub(3)
     }
 
-    fn reserve_space(&mut self, references: usize, length: usize) -> Option<BackingPageGuard> {
+    fn reserve_space(&mut self, references: usize, length: usize) -> Option<Guard> {
         if self.bytes.is_empty() || self.num_entries() == 0 {
             self.resize(references, length);
             let bytes_length = self.bytes.len();
@@ -568,7 +585,7 @@ impl Page {
                 bytes[..8].copy_from_slice(&(references as u64).to_le_bytes());
                 bytes = &mut bytes[8..];
             }
-            Some(BackingPageGuard {
+            Some(Guard {
                 tuple: TupleID::with_page_and_slot(self.page_id, 0),
                 data_length: bytes.len(),
                 data_bytes: bytes.as_mut_ptr(),
@@ -610,7 +627,7 @@ impl Page {
                     newly_used_bytes[..8].copy_from_slice(&(references as u64).to_le_bytes());
                     newly_used_bytes = &mut newly_used_bytes[8..];
                 }
-                Some(BackingPageGuard {
+                Some(Guard {
                     tuple: TupleID::with_page_and_slot(
                         self.page_id,
                         (entry_pointer_end as usize - 7) / 3,
@@ -630,6 +647,8 @@ impl Page {
     }
 }
 
+/// A controller object that represents the file. The controller object keeps track of the currently
+/// loaded page and keeping the header up to date.
 pub struct NaivePageController<S: SegmentController> {
     header: FileHeader,
     header_is_dirty: bool,
@@ -638,6 +657,7 @@ pub struct NaivePageController<S: SegmentController> {
 }
 
 impl<S: SegmentController> NaivePageController<S> {
+    /// Creates a new controller for a new file.
     pub fn from_new(segment_controller: S) -> Result<Self> {
         let header = FileHeader::new();
         Ok(NaivePageController {
@@ -648,6 +668,7 @@ impl<S: SegmentController> NaivePageController<S> {
         })
     }
 
+    /// Creates a new controller for an existing file.
     pub fn from_existing(mut segment_controller: S) -> Result<Self> {
         let header = FileHeader::from_bytes(segment_controller.read_segment(0)?)?;
         Ok(NaivePageController {
@@ -689,10 +710,12 @@ impl<S: SegmentController> NaivePageController<S> {
 }
 
 impl<'a, S: SegmentController> NaivePageController<S> {
+    /// Gets the header for the file
     pub fn get_header(&self) -> &FileHeader {
         &self.header
     }
 
+    /// Returns the data associated with the given entry.
     pub fn get_entry_bytes(&mut self, tuple: TupleID) -> Result<ByteRange> {
         self.load_page(tuple.page)?;
         let page = self.current_page.as_ref().unwrap();
@@ -701,11 +724,9 @@ impl<'a, S: SegmentController> NaivePageController<S> {
             .ok_or_else(|| SlottedPageError::NotFound(tuple))
     }
 
-    pub fn reserve_space(
-        &'a mut self,
-        references: usize,
-        data_length: usize,
-    ) -> Result<BackingPageGuard> {
+    /// Reserves space for an item to be written. The length must be given in the number of
+    /// references and the number of data bytes required.
+    pub fn reserve_space(&'a mut self, references: usize, data_length: usize) -> Result<Guard> {
         let length = references * TupleID::SERIALIZED_SIZE + data_length;
         if let Some((dirty, page)) = &mut self.current_page {
             *dirty = true;
@@ -740,26 +761,36 @@ impl<S: SegmentController> Drop for NaivePageController<S> {
     }
 }
 
+/// A trait for types that can be loaded from a file and deserialized without any other information.
 pub trait Loadable {
+    /// The resultant type that is deserialized from the file.
     type LoadType;
 
+    /// Loads the item from the file.
     fn load<S: SegmentController>(
         self,
         file: &mut NaivePageController<S>,
     ) -> Result<Self::LoadType>;
 }
 
+/// A trait for types that can be written to the file.
 pub trait Serialize {
+    /// The data length required for the object.
     fn data_length(&self) -> usize;
 
+    /// Serializes all the relevant references. The TupleIDs should be stored in the references
+    /// vector. The references will be stored in the order given in the vector.
     fn serialize_references<'a, S: SegmentController>(
         &self,
         file: &'a mut NaivePageController<S>,
         references: &mut Vec<TupleID>,
     ) -> Result<()>;
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()>;
+    /// Serializes the data part of the object. The guard passed in will have at least data_length()
+    /// data bytes free.  
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()>;
 
+    /// Serializes the object to file.
     fn serialize<S: SegmentController>(
         &self,
         file: &mut NaivePageController<S>,
@@ -787,9 +818,9 @@ pub trait Serialize {
     }
 }
 
-pub struct LoadNotNecessary<T: for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>> {
-    inner: T,
-}
+/// A wrapper type to indicate that loading is not necessary for a type. Objects wrapped in this
+/// type will be return verbatim when loading.
+pub struct LoadNotNecessary<T: for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>>(T);
 
 impl<T: for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>> Loadable for LoadNotNecessary<T> {
     type LoadType = T;
@@ -798,7 +829,7 @@ impl<T: for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>> Loadable for Load
         self,
         _file: &mut NaivePageController<S>,
     ) -> Result<Self::LoadType> {
-        Ok(self.inner)
+        Ok(self.0)
     }
 }
 
@@ -808,18 +839,17 @@ impl<'b, T: for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>> TryFrom<ByteR
     type Error = anyhow::Error;
 
     fn try_from(t: ByteRange<'b>) -> std::result::Result<Self, anyhow::Error> {
-        Ok(LoadNotNecessary {
-            inner: T::try_from(t)?,
-        })
+        Ok(LoadNotNecessary(T::try_from(t)?))
     }
 }
 
-pub struct TypedTupleId<T: Deserialize> {
+/// A TupleID that is equiped with a type for convenient deserialization into the type.
+pub struct TypedTupleID<T: Deserialize> {
     tuple: TupleID,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: Deserialize> Loadable for TypedTupleId<T> {
+impl<T: Deserialize> Loadable for TypedTupleID<T> {
     type LoadType = T;
 
     fn load<S: SegmentController>(
@@ -830,10 +860,14 @@ impl<T: Deserialize> Loadable for TypedTupleId<T> {
     }
 }
 
-// Restructure to build on the lazy motif.
+/// A trait for items that can be deserialized. The difference between Deserialize and Loadable is
+/// that Deserialize takes in an additional entry ID to deserialize, while Loadable does not.
 pub trait Deserialize: Sized {
+    /// The LoadType is the proto representation of the Self, but one that can be loaded into Self.
+    /// The LoadType cannot borrow items from the ByteRange.
     type LoadType: Loadable<LoadType = Self> + for<'a> TryFrom<ByteRange<'a>, Error = anyhow::Error>;
 
+    /// Deserializes the given entry ID into an object.
     fn deserialize<S: SegmentController>(
         file: &mut NaivePageController<S>,
         tuple: TupleID,
@@ -859,7 +893,7 @@ impl Serialize for bool {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(1)?[0] = *self as u8;
         Ok(())
     }
@@ -902,7 +936,7 @@ impl Serialize for u8 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(1)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -925,7 +959,7 @@ impl Serialize for u16 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(2)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -958,7 +992,7 @@ impl Serialize for u32 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(4)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -991,7 +1025,7 @@ impl Serialize for u64 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1024,7 +1058,7 @@ impl Serialize for usize {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1057,7 +1091,7 @@ impl Serialize for i8 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(1)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1090,7 +1124,7 @@ impl Serialize for i16 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(2)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1123,7 +1157,7 @@ impl Serialize for i32 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(4)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1156,7 +1190,7 @@ impl Serialize for i64 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1189,7 +1223,7 @@ impl Serialize for isize {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1222,7 +1256,7 @@ impl Serialize for f32 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(4)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1255,7 +1289,7 @@ impl Serialize for f64 {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard.reserve_space(8)?.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
@@ -1288,7 +1322,7 @@ impl Serialize for char {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         self.encode_utf8(guard.reserve_space(self.data_length())?);
         Ok(())
     }
@@ -1324,7 +1358,7 @@ impl Serialize for str {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard
             .reserve_space(self.data_length())?
             .copy_from_slice(&self.as_bytes());
@@ -1345,7 +1379,7 @@ impl Serialize for String {
         Ok(())
     }
 
-    fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
         guard
             .reserve_space(self.data_length())?
             .copy_from_slice(&self.as_bytes());
@@ -1382,31 +1416,32 @@ impl<T: Serialize> Serialize for Box<T> {
         Ok(())
     }
 
-    fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, _guard: &mut Guard) -> Result<()> {
         Ok(())
     }
 }
 
-impl<'a, T: Deserialize> TryFrom<ByteRange<'a>> for TypedTupleId<T> {
+impl<'a, T: Deserialize> TryFrom<ByteRange<'a>> for TypedTupleID<T> {
     type Error = anyhow::Error;
 
     fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
         let reference = value.reference(0).unwrap();
-        Ok(TypedTupleId {
+        Ok(TypedTupleID {
             tuple: reference,
             _marker: std::marker::PhantomData,
         })
     }
 }
 
-pub struct BoxedTupleID<T: Deserialize>(TypedTupleId<T>);
+/// A wrapper type to load an item into a Box.
+pub struct BoxedTupleID<T: Deserialize>(TypedTupleID<T>);
 
 impl<'a, T: Deserialize> TryFrom<ByteRange<'a>> for BoxedTupleID<T> {
     type Error = anyhow::Error;
 
     fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
         let reference = value.reference(0).unwrap();
-        Ok(BoxedTupleID(TypedTupleId {
+        Ok(BoxedTupleID(TypedTupleID {
             tuple: reference,
             _marker: std::marker::PhantomData,
         }))
@@ -1428,14 +1463,15 @@ impl<T: Deserialize> Deserialize for Box<T> {
     type LoadType = BoxedTupleID<T>;
 }
 
-pub struct RcedTupleID<T: Deserialize>(TypedTupleId<T>);
+/// A wrapper type to load an item into a Rc.
+pub struct RcedTupleID<T: Deserialize>(TypedTupleID<T>);
 
 impl<'a, T: Deserialize> TryFrom<ByteRange<'a>> for RcedTupleID<T> {
     type Error = anyhow::Error;
 
     fn try_from(value: ByteRange<'a>) -> std::result::Result<Self, Self::Error> {
         let reference = value.reference(0).unwrap();
-        Ok(RcedTupleID(TypedTupleId {
+        Ok(RcedTupleID(TypedTupleID {
             tuple: reference,
             _marker: std::marker::PhantomData,
         }))
@@ -1467,7 +1503,7 @@ impl<T: Serialize> Serialize for Rc<T> {
         Ok(())
     }
 
-    fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, _guard: &mut Guard) -> Result<()> {
         Ok(())
     }
 }
@@ -1490,7 +1526,7 @@ impl<T: Serialize> Serialize for Weak<T> {
         Ok(())
     }
 
-    fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, _guard: &mut Guard) -> Result<()> {
         Ok(())
     }
 }
@@ -1509,7 +1545,7 @@ impl Serialize for TupleID {
         Ok(())
     }
 
-    fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+    fn serialize_data(&self, _guard: &mut Guard) -> Result<()> {
         Ok(())
     }
 }
@@ -1917,7 +1953,7 @@ mod tests {
                 Ok(())
             }
 
-            fn serialize_data(&self, guard: &mut BackingPageGuard) -> Result<()> {
+            fn serialize_data(&self, guard: &mut Guard) -> Result<()> {
                 self.name.len().serialize_data(guard)?;
                 self.name.serialize_data(guard)?;
                 self.occupation.serialize_data(guard)
@@ -1962,8 +1998,8 @@ mod tests {
         }
 
         struct LazyPerson {
-            name: TypedTupleId<String>,
-            occupation: TypedTupleId<String>,
+            name: TypedTupleID<String>,
+            occupation: TypedTupleID<String>,
         }
 
         impl<'a> TryFrom<ByteRange<'a>> for LazyPerson {
@@ -1973,11 +2009,11 @@ mod tests {
                 let name = value.reference(0).unwrap();
                 let occupation = value.reference(1).unwrap();
                 Ok(LazyPerson {
-                    name: TypedTupleId {
+                    name: TypedTupleID {
                         tuple: name,
                         _marker: std::marker::PhantomData,
                     },
-                    occupation: TypedTupleId {
+                    occupation: TypedTupleID {
                         tuple: occupation,
                         _marker: std::marker::PhantomData,
                     },
@@ -2014,7 +2050,7 @@ mod tests {
                 Ok(())
             }
 
-            fn serialize_data(&self, _guard: &mut BackingPageGuard) -> Result<()> {
+            fn serialize_data(&self, _guard: &mut Guard) -> Result<()> {
                 Ok(())
             }
         }

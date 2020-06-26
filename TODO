@@ -13,8 +13,8 @@
    [] Store an additional num_entries variable.
    [] Store an additional used_space_start variable.
    [] Make a flush method to flush these to the bytes of the page.
-[] Refactor
-[] Document
+✔ Refactor @done(20-06-25 20:16)
+✔ Document @done(20-06-26 13:09)
 [] Look at pages that are 8K, 16K, 32K, 64K in size.
 ✔ Add a root entry pointer to the file header. @done(20-06-16 23:38)
 [] Write a garbage collector and defragmentor program/library.
