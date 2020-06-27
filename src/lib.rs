@@ -313,16 +313,18 @@ struct Page {
 }
 
 impl Page {
-    fn from_bytes<S>(page_id: usize, controller: &mut S) -> Result<Self>
+    async fn from_bytes<S>(page_id: usize, controller: &mut S) -> Result<Self>
     where
         S: SegmentController,
     {
         let mut bytes: Vec<u8> = Vec::new();
         bytes.resize_with(SEGMENT_SIZE, Default::default);
-        controller.read_segments_into(page_id, &mut bytes)?;
+        controller.read_segments_into(page_id, &mut bytes).await?;
         let additional_segments = u16::from_le_bytes(bytes[1..3].try_into().unwrap()) as usize;
         bytes.resize_with(SEGMENT_SIZE * (additional_segments + 1), Default::default);
-        controller.read_segments_into(page_id + 1, &mut bytes[SEGMENT_SIZE..])?;
+        controller
+            .read_segments_into(page_id + 1, &mut bytes[SEGMENT_SIZE..])
+            .await?;
         Ok(Page { page_id, bytes })
     }
 
@@ -566,8 +568,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    #[test]
-    fn single() {
+    #[tokio::test]
+    async fn single() {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
@@ -577,11 +579,15 @@ mod tests {
                 .unwrap()
                 .copy_from_slice(&5usize.to_le_bytes());
             guard.commit();
+            file.flush().await.unwrap()
         }
         {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes))
+                .await
+                .unwrap();
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 0))
+                .await
                 .unwrap();
             let bytes = entry_bytes.data_bytes();
             let entry = usize::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -590,8 +596,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn multiple() {
+    #[tokio::test]
+    async fn multiple() {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
@@ -613,23 +619,29 @@ mod tests {
                 .unwrap()
                 .copy_from_slice("roflpi".as_bytes());
             guard.commit();
+            file.flush().await.unwrap()
         }
         {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes))
+                .await
+                .unwrap();
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 0))
+                .await
                 .unwrap();
             let bytes = entry_bytes.data_bytes();
             let entry = usize::from_le_bytes(bytes[..8].try_into().unwrap());
             assert_eq!(entry, 5);
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 1))
+                .await
                 .unwrap();
             let bytes = entry_bytes.data_bytes();
             let entry = usize::from_le_bytes(bytes[..8].try_into().unwrap());
             assert_eq!(entry, 900);
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 2))
+                .await
                 .unwrap();
             let bytes = entry_bytes.data_bytes();
             let entry = std::str::from_utf8(bytes).unwrap();
@@ -637,8 +649,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn large() {
+    #[tokio::test]
+    async fn large() {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
@@ -647,11 +659,16 @@ mod tests {
                 .reserve_space(30000)
                 .unwrap()
                 .copy_from_slice("lol".repeat(10000).as_bytes());
+            guard.commit();
+            file.flush().await.unwrap()
         }
         {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes))
+                .await
+                .unwrap();
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 0))
+                .await
                 .unwrap();
             let bytes = entry_bytes.data_bytes();
             let entry = std::str::from_utf8(bytes).unwrap();
@@ -659,8 +676,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn single_reference() {
+    #[tokio::test]
+    async fn single_reference() {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
@@ -669,11 +686,15 @@ mod tests {
                 .add_reference(EntryID::with_page_and_slot(1, 1))
                 .unwrap();
             guard.commit();
+            file.flush().await.unwrap()
         }
         {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes))
+                .await
+                .unwrap();
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 0))
+                .await
                 .unwrap();
             let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
@@ -681,8 +702,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn double_reference() {
+    #[tokio::test]
+    async fn double_reference() {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
@@ -692,22 +713,28 @@ mod tests {
                     .add_reference(EntryID::with_page_and_slot(1, 1))
                     .unwrap();
                 guard.commit();
+                let mut guard = file.reserve_space(1, 0, true).unwrap();
+                guard
+                    .add_reference(EntryID::with_page_and_slot(1, 2))
+                    .unwrap();
+                guard.commit();
+                file.flush().await.unwrap()
             }
-            let mut guard = file.reserve_space(1, 0, true).unwrap();
-            guard
-                .add_reference(EntryID::with_page_and_slot(1, 2))
-                .unwrap();
         }
         {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes))
+                .await
+                .unwrap();
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 0))
+                .await
                 .unwrap();
             let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
             assert_eq!(entry.slot, 1);
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 1))
+                .await
                 .unwrap();
             let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
@@ -715,8 +742,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn single_reference_with_large() {
+    #[tokio::test]
+    async fn single_reference_with_large() {
         let mut bytes = Vec::new();
         {
             let mut file = NaivePageController::from_new(Cursor::new(&mut bytes)).unwrap();
@@ -728,17 +755,23 @@ mod tests {
             let tuple_id = guard.commit();
             let mut guard = file.reserve_space(1, 0, false).unwrap();
             guard.add_reference(tuple_id).unwrap();
+            guard.commit();
+            file.flush().await.unwrap()
         }
         {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes))
+                .await
+                .unwrap();
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 0))
+                .await
                 .unwrap();
             let entry = std::str::from_utf8(entry_bytes.data_bytes()).unwrap();
             assert_eq!(entry.len(), 30000);
             assert_eq!(entry, "lol".repeat(10000));
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 1))
+                .await
                 .unwrap();
             let entry = entry_bytes.reference(0).unwrap();
             assert_eq!(entry.page, 1);
@@ -752,8 +785,8 @@ mod tests {
         occupation: String,
     }
 
-    #[test]
-    fn test_complex() {
+    #[tokio::test]
+    async fn test_complex() {
         let person = Person {
             name: "alice".to_owned(),
             occupation: "blacksmith".to_owned(),
@@ -776,11 +809,15 @@ mod tests {
                 .unwrap()
                 .copy_from_slice(&person.occupation.as_bytes());
             guard.commit();
+            file.flush().await.unwrap()
         }
         {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes))
+                .await
+                .unwrap();
             let entry_bytes = file
                 .get_entry_bytes(EntryID::with_page_and_slot(1, 0))
+                .await
                 .unwrap();
             let name_len_bytes = &entry_bytes.data_bytes()[..8];
             let name_len = usize::from_le_bytes(name_len_bytes[..8].try_into().unwrap());
@@ -796,8 +833,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_complex_reference() {
+    #[tokio::test]
+    async fn test_complex_reference() {
         let person = Person {
             name: "alice".to_owned(),
             occupation: "blacksmith".to_owned(),
@@ -821,11 +858,15 @@ mod tests {
             let mut guard = file.reserve_space(2, 0, true).unwrap();
             guard.add_reference(name_reference).unwrap();
             guard.add_reference(occupation_reference).unwrap();
-            (guard.commit(), name_reference, occupation_reference)
+            let person_reference = guard.commit();
+            file.flush().await.unwrap();
+            (person_reference, name_reference, occupation_reference)
         };
         {
-            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes)).unwrap();
-            let entry_bytes = file.get_entry_bytes(root_reference).unwrap();
+            let mut file = NaivePageController::from_existing(Cursor::new(&mut bytes))
+                .await
+                .unwrap();
+            let entry_bytes = file.get_entry_bytes(root_reference).await.unwrap();
             assert_eq!(
                 entry_bytes.references().collect::<Vec<_>>(),
                 vec![name_reference, occupation_reference]
@@ -834,12 +875,12 @@ mod tests {
             assert_eq!(input_name_reference, name_reference);
             let input_occupation_reference = entry_bytes.reference(1).unwrap();
             assert_eq!(input_occupation_reference, occupation_reference);
-            let name_bytes = file.get_entry_bytes(name_reference).unwrap();
+            let name_bytes = file.get_entry_bytes(name_reference).await.unwrap();
             let name = std::str::from_utf8(name_bytes.data_bytes())
                 .unwrap()
                 .to_owned();
             assert_eq!(name, person.name);
-            let occupation_bytes = file.get_entry_bytes(occupation_reference).unwrap();
+            let occupation_bytes = file.get_entry_bytes(occupation_reference).await.unwrap();
             let occupation = std::str::from_utf8(occupation_bytes.data_bytes())
                 .unwrap()
                 .to_owned();

@@ -9,3 +9,5 @@ edition = "2018"
 [dependencies]
 anyhow = "*"
 thiserror = "*"
+tokio = {version = "*", features = ["fs", "io-util", "test-util", "rt-threaded", "macros"]}
+async-trait = "*"
