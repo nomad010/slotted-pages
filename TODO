@@ -30,4 +30,4 @@
 [] Remove SegmentController trait with just Write + Read + Seek Bounds
 ✔ Add Serialize/Deserialize Traits and Lazy struct @done(20-06-27 00:01)
 [] Tests for root reference change
-[] Async branch
+✔ Async branch @done(20-06-27 15:34)
